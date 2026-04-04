@@ -403,7 +403,13 @@ def handle_function_call(
 
         try:
             from hermes_cli.plugins import invoke_hook
-            invoke_hook("pre_tool_call", tool_name=function_name, args=function_args, task_id=task_id or "")
+            _pre_results = invoke_hook("pre_tool_call", tool_name=function_name, args=function_args, task_id=task_id or "")
+            # Plugins can block tool calls by returning {"blocked": True, "message": "..."}
+            for _pr in (_pre_results or []):
+                if isinstance(_pr, dict) and _pr.get("blocked"):
+                    _block_msg = _pr.get("message", f"Tool call '{function_name}' blocked by plugin")
+                    logger.warning("Plugin blocked tool call %s: %s", function_name, _block_msg)
+                    return json.dumps({"error": _block_msg}, ensure_ascii=False)
         except Exception:
             pass
 
@@ -425,7 +431,12 @@ def handle_function_call(
 
         try:
             from hermes_cli.plugins import invoke_hook
-            invoke_hook("post_tool_call", tool_name=function_name, args=function_args, result=result, task_id=task_id or "")
+            _post_results = invoke_hook("post_tool_call", tool_name=function_name, args=function_args, result=result, task_id=task_id or "")
+            # Plugins can replace tool output by returning {"result": "..."}
+            for _pr in (_post_results or []):
+                if isinstance(_pr, dict) and "result" in _pr:
+                    logger.debug("Plugin modified result for %s", function_name)
+                    result = _pr["result"]
         except Exception:
             pass
 
