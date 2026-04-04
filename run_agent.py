@@ -89,7 +89,7 @@ from agent.model_metadata import (
 )
 from agent.context_compressor import ContextCompressor
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, load_rules, load_samples, load_working_state, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -2446,6 +2446,15 @@ class AIAgent:
                 _identity = DEFAULT_AGENT_IDENTITY
             prompt_parts = [_identity]
 
+        # Governance rules from ~/.hermes/rules/*.md (extended traps, quality gate)
+        if not self.skip_context_files:
+            _rules_content = load_rules()
+            if _rules_content:
+                prompt_parts.append(_rules_content)
+            _samples_content = load_samples()
+            if _samples_content:
+                prompt_parts.append(_samples_content)
+
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
@@ -2515,6 +2524,12 @@ class AIAgent:
                     prompt_parts.append(_ext_mem_block)
             except Exception:
                 pass
+
+        # Working state: cross-session context (active tasks, decisions, blockers)
+        if not self.skip_context_files:
+            _ws_content = load_working_state()
+            if _ws_content:
+                prompt_parts.append(_ws_content)
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:

@@ -2709,6 +2709,19 @@ class GatewayRunner:
             response = agent_result.get("final_response") or ""
             agent_messages = agent_result.get("messages", [])
 
+            # ── Structural output redaction ──────────────────────────────
+            # Redact credentials/secrets from the response BEFORE platform
+            # delivery.  The LLM can compose a response that re-states
+            # secrets (e.g. summarising a .env file or terminal output).
+            # This is the last structural defence before text reaches
+            # Discord/Telegram/etc.
+            if response:
+                try:
+                    from agent.redact import redact_sensitive_text
+                    response = redact_sensitive_text(response)
+                except Exception:
+                    pass  # Don't block delivery on redaction failure
+
             # Surface error details when the agent failed silently (final_response=None)
             if not response and agent_result.get("failed"):
                 error_detail = agent_result.get("error", "unknown error")
