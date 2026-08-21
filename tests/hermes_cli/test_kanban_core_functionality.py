@@ -290,6 +290,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         "v": _kb.WORKER_IDENTITY_VERSION, "scheme": "linux_proc",
         "pid": int(pid), "starttime": 4242, "pgid": int(pid), "sid": int(pid),
         "ppid": 1, "boot_id": "boot-under-test",
+        "host_scope_id": _kb._read_host_scope_id(),
     }
     for m in _modules:
         m.capture_worker_identity = _stub_identity
@@ -422,6 +423,33 @@ def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _persist_quiesced_test_worker(conn, task_id, pid):
+    """Give a synthetic dead PID the complete scope proof production stores."""
+    identity = json.dumps({
+        "v": kb.WORKER_IDENTITY_VERSION,
+        "scheme": "create_time",
+        "pid": int(pid),
+        "create_time": 1000.0,
+        "pgid": int(pid),
+        "sid": int(pid),
+        "host_scope_id": kb._read_host_scope_id(),
+    })
+    with kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_identity = ? WHERE id = ?",
+            (pid, identity, task_id),
+        )
+        if row and row["current_run_id"] is not None:
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_identity = ? "
+                "WHERE id = ?",
+                (pid, identity, row["current_run_id"]),
+            )
+
+
 
 
 
@@ -439,7 +467,11 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
+        _persist_quiesced_test_worker(conn, tid, 98765)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(
+            _kb, "_stored_worker_group_alive", lambda _identity, _pid=None: False,
+        )
         assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
@@ -1246,10 +1278,22 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        identity = {
+            "v": _kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": 12345,
+            "create_time": 1000.0,
+            "pgid": 12345,
+            "sid": 12345,
+            "host_scope_id": _kb._read_host_scope_id(),
+        }
+        monkeypatch.setattr(
+            _kb, "capture_worker_identity", lambda _pid: dict(identity),
+        )
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, t),
+            "worker_pid=?, worker_identity=? WHERE id=?",
+            (lock, future, 12345, json.dumps(identity), t),
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
@@ -1285,28 +1329,14 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        # Ownership proof: this row's pid was injected by raw SQL with no
-        # ``worker_identity``, exactly like a claim made before that column
-        # existed. Reclaim must therefore signal NOTHING — the pid may name
-        # anything by now. The operator-driven reclaim still releases the card
-        # (that is its whole purpose), but the receipt says plainly that no
-        # worker was killed rather than implying one was.
-        assert reclaim_evs[0].get("termination_attempted") is not True
-        assert reclaim_evs[0].get("signalled") is False
-        assert reclaim_evs[0].get("ownership_reason") in {
-            "identity_absent", "already_dead",
-        }
-        # ``terminated`` now tracks the pid's actual fate: True when it was
-        # already gone (nothing to kill, nothing to be wrong about), False when
-        # an unprovable process is still there. Which of those holds for a
-        # hand-injected pid depends on the machine, so assert the invariant
-        # that does not: no signal was sent, on either branch.
-        if reclaim_evs[0].get("ownership_reason") == "already_dead":
-            assert reclaim_evs[0].get("terminated") is True
-        else:
-            assert reclaim_evs[0].get("ownership_reason") == "identity_absent"
-            assert reclaim_evs[0].get("terminated") is False
-        assert killed == []
+        # The exact birth identity was persisted and re-verified, so the
+        # operator reclaim may terminate this worker before releasing.
+        assert reclaim_evs[0].get("termination_attempted") is True
+        assert reclaim_evs[0].get("signalled") is True
+        assert reclaim_evs[0].get("ownership") == "proven"
+        assert reclaim_evs[0].get("ownership_reason") == "ok"
+        assert reclaim_evs[0].get("terminated") is True
+        assert killed
     finally:
         conn.close()
 
@@ -1340,13 +1370,17 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
     assert claimed is not None, "task was not claimable for the next attempt"
     _kb._set_worker_pid(conn, tid, fake_pid)
+    _persist_quiesced_test_worker(conn, tid, fake_pid)
     _kb._record_worker_exit(fake_pid, raw_status)
     original_alive = _kb._pid_alive
+    original_group_alive = _kb._stored_worker_group_alive
     _kb._pid_alive = lambda p: False
+    _kb._stored_worker_group_alive = lambda _identity, _pid=None: False
     try:
         return _kb.detect_crashed_workers(conn)
     finally:
         _kb._pid_alive = original_alive
+        _kb._stored_worker_group_alive = original_group_alive
 
 
 def _drive_protocol_violation(conn, tid, fake_pid):
@@ -1451,5 +1485,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

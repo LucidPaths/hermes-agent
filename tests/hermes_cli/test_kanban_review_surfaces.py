@@ -11,6 +11,37 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
 
+_SYNTHETIC_WORKER_PID = 987654
+
+
+def _enable_synthetic_worker_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give lifecycle-only tests a complete dispatcher authority tuple."""
+    monkeypatch.setattr(
+        kb,
+        "capture_worker_identity",
+        lambda pid: {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": int(pid),
+            "create_time": 1000.0,
+            "pgid": int(pid),
+            "sid": int(pid),
+            "host_scope_id": kb._read_host_scope_id(),
+        },
+    )
+
+
+def _release_synthetic_worker_scope(conn, task_id: str, status: str) -> None:
+    """Model the dispatcher observing a clean worker exit between lanes."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_identity = NULL "
+            "WHERE id = ? AND status = ?",
+            (task_id, status),
+        )
+
+
 @pytest.fixture
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     home = tmp_path / ".hermes"
@@ -19,12 +50,14 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "builder")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    _enable_synthetic_worker_identity(monkeypatch)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="Review tool contract", assignee="builder")
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
+        kb._set_worker_pid(conn, task_id, _SYNTHETIC_WORKER_PID)
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     return task_id
@@ -55,8 +88,10 @@ def test_review_tools_redact_handoff_and_route_changes(
         assert handoff is not None
         assert secret not in (handoff.summary or "")
         assert secret not in json.dumps(handoff.metadata)
+        _release_synthetic_worker_scope(conn, review_worker, "review")
         review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
         assert review is not None
+        kb._set_worker_pid(conn, review_worker, _SYNTHETIC_WORKER_PID)
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
@@ -121,6 +156,7 @@ def test_review_cli_round_trip_preserves_handoff(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _enable_synthetic_worker_identity(monkeypatch)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
@@ -128,6 +164,7 @@ def test_review_cli_round_trip_preserves_handoff(
         task_id = kb.create_task(conn, title="CLI review", assignee="builder")
         implementation = kb.claim_task(conn, task_id, claimer="builder:1")
         assert implementation is not None
+        kb._set_worker_pid(conn, task_id, _SYNTHETIC_WORKER_PID)
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
 
@@ -144,8 +181,10 @@ def test_review_cli_round_trip_preserves_handoff(
         handoff = kb.latest_run(conn, task_id)
         assert handoff is not None
         assert handoff.metadata == {"tests_run": 3}
+        _release_synthetic_worker_scope(conn, task_id, "review")
         review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
         assert review is not None
+        kb._set_worker_pid(conn, task_id, _SYNTHETIC_WORKER_PID)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
 
     output = kc.run_slash(
@@ -166,12 +205,14 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    _enable_synthetic_worker_identity(monkeypatch)
     secret = "ghp_" + "R" * 40
 
     with kb.connect() as conn:
         direct_id = kb.create_task(conn, title="direct redaction", assignee="builder")
         direct_run = kb.claim_task(conn, direct_id)
         assert direct_run is not None
+        kb._set_worker_pid(conn, direct_id, _SYNTHETIC_WORKER_PID)
         assert kb.request_review(
             conn,
             direct_id,
@@ -189,8 +230,10 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
         assert secret not in json.dumps(run.metadata)
         assert secret not in json.dumps(event.payload)
 
+        _release_synthetic_worker_scope(conn, direct_id, "review")
         review = kb.claim_review_task(conn, direct_id)
         assert review is not None
+        kb._set_worker_pid(conn, direct_id, _SYNTHETIC_WORKER_PID)
         assert kb.request_changes(
             conn,
             direct_id,

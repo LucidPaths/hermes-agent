@@ -130,6 +130,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 # ---------------------------------------------------------------------------
 
 def test_run_slash_reclaim_running_task(kanban_home):
+    import json
     import re
     import time
     import secrets
@@ -143,11 +144,23 @@ def test_run_slash_reclaim_running_task(kanban_home):
     # Simulate a running claim outside TTL.
     conn = kb.connect()
     try:
-        lock = secrets.token_hex(4)
+        lock = f"{kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(4)}"
+        identity = {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": 4242,
+            "create_time": 1000.0,
+            "pgid": 4242,
+            "sid": 4242,
+            "host_scope_id": kb._read_host_scope_id(),
+        }
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, int(time.time()) + 3600, 4242, tid),
+            "worker_pid=?, worker_identity=? WHERE id=?",
+            (
+                lock, int(time.time()) + 3600, 4242,
+                json.dumps(identity), tid,
+            ),
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
@@ -177,5 +190,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-

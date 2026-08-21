@@ -5523,11 +5523,13 @@ def reclaim_task(
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
-    Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    Returns True if a reclaim happened. Returns False when the task is not
+    reclaimable or the prior execution scope could not be proven quiescent;
+    in the latter case the claim is retained and a deferred receipt is added.
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, worker_identity "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5536,26 +5538,53 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    # Operator-driven, so this path RELEASES even when ownership cannot be
-    # proven — an operator who reaches for reclaim needs the card unstuck, and
-    # refusing would leave them no recovery at all. What the proof still buys
-    # is that we never signal a pid we cannot prove: the receipt records
-    # ``ownership`` / ``ownership_reason`` so a reclaim that could not kill
-    # anything says so instead of implying a dead worker.
+    stored_identity = row["worker_identity"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock,
-        stored_identity=_stored_worker_identity(conn, task_id),
+        stored_identity=stored_identity,
         signal_fn=signal_fn,
     )
-    with write_txn(conn):
-        retry_status = _retry_status_for_run(conn, task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, worker_identity = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+    # Operator intent does not fence the old process from the workspace. The
+    # same fail-closed rule therefore applies here as in every automatic
+    # reclaim path: do not make the card spawnable until the old scope is
+    # proven unable to act.
+    hold_reason = _reclaim_hold_reason(termination)
+    if (
+        hold_reason
+        or not _worker_scope_is_quiescent(
+            stored_identity, row["worker_pid"],
         )
+    ):
+        if not hold_reason:
+            termination["ownership_unproven"] = True
+            termination["ownership_reason"] = "worker_scope_not_quiescent"
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="manual_reclaim_worker_scope_alive",
+        )
+        return False
+    with write_txn(conn):
+        if row["status"] in {"review", "ready", "todo"}:
+            # The prior run already ended and deliberately landed in this
+            # phase. Reclaim only its retained authority fence; do not reroute
+            # review to implementation or bypass an unmet parent by converting
+            # todo to ready.
+            retry_status = row["status"]
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_identity = NULL "
+                "WHERE id = ? AND status = ? AND claim_lock IS ?",
+                (task_id, row["status"], prev_lock),
+            )
+        else:
+            retry_status = _retry_status_for_run(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_identity = NULL "
+                "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+                "AND claim_lock IS ?",
+                (retry_status, task_id, prev_lock),
+            )
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
@@ -6918,11 +6947,11 @@ def request_review(
     exposed to the review dispatcher.  On re-review, omitting it reuses the
     reviewer provenance persisted by the latest ``changes_requested`` event.
 
-    When the task is ``running`` under a live claim, a caller that supplies no
-    ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
-    — otherwise the request is refused instead of silently clearing the live
-    worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
-    their own run id as ``expected_run_id`` (unchanged).
+    A worker proves ownership with ``expected_run_id``. Its transition keeps
+    the claim/PID/birth proof as a fence until the dispatcher observes that
+    the worker and its process group have exited; only then can a reviewer be
+    spawned. An operator cannot use ``force=True`` to discard a live claim —
+    the worker must first be reclaimed through the guarded reclaim path.
 
     Returns ``bool`` by default. With ``with_reason=True`` returns
     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
@@ -6938,25 +6967,57 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+            "worker_identity "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
-        # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True).
-        if (
-            expected_run_id is None
-            and not force
-            and trow["status"] == "running"
-            and trow["claim_lock"] is not None
-        ):
+        # A running worker must present one complete authority tuple. A
+        # missing lock beside a persisted PID/identity is corruption, not
+        # permission to discard the last scope proof. ``force`` and a run id
+        # establish caller intent, but neither makes that old scope harmless.
+        authority_present = any(
+            trow[field] is not None
+            for field in ("claim_lock", "worker_pid", "worker_identity")
+        )
+        if trow["status"] == "running":
+            if (
+                trow["claim_lock"] is None
+                or trow["worker_pid"] is None
+                or trow["worker_identity"] is None
+                or trow["current_run_id"] is None
+            ):
+                return _ret(
+                    False,
+                    "running task has incomplete worker authority; reclaim "
+                    "and prove the prior worker scope quiescent before "
+                    "requesting review",
+                )
+            if expected_run_id is None:
+                return _ret(
+                    False,
+                    "task is running under a live claim; pass expected_run_id "
+                    "from the owning worker instead of clearing its authority",
+                )
+            if int(trow["current_run_id"]) != int(expected_run_id):
+                return _ret(False, "run_id mismatch")
+            if not _identity_can_fence_handoff(
+                trow["worker_pid"], trow["worker_identity"],
+            ):
+                return _ret(
+                    False,
+                    "worker authority cannot prove a releasable host/process "
+                    "scope; retry after pid, host scope, and group identity "
+                    "are persisted",
+                )
+        elif authority_present:
             return _ret(
                 False,
-                "task is running under a live claim; pass expected_run_id "
-                "(worker ownership) or force=True (explicit operator "
-                "override) instead of clearing the live run's claim",
+                "task has retained worker authority; reclaim and prove the "
+                "prior worker scope quiescent before requesting review",
             )
+        preserve_worker_authority = trow["status"] == "running"
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -7009,15 +7070,17 @@ def request_review(
                 else (task_id, int(expected_run_id))
             )
             run_guard = " AND current_run_id = ?"
+        authority_sql = "" if preserve_worker_authority else """
+                   , claim_lock      = NULL
+                   , claim_expires   = NULL
+                   , worker_pid      = NULL
+                   , worker_identity = NULL
+        """
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'review',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL,
-                   worker_identity = NULL
-            """ + assignee_sql + """
+               SET status = 'review'
+            """ + authority_sql + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
             """ + run_guard,
@@ -7082,7 +7145,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, claim_lock, worker_pid, "
+            "worker_identity FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -7092,6 +7156,17 @@ def request_changes(
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
+        if expected_run_id is None:
+            return False, "expected_run_id is required for the owning reviewer"
+        if (
+            task_row["claim_lock"] is None
+            or task_row["worker_pid"] is None
+            or task_row["worker_identity"] is None
+        ):
+            return False, (
+                "reviewer has incomplete worker authority; reclaim and prove "
+                "the prior reviewer scope quiescent before requesting changes"
+            )
 
         claimed_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -7111,6 +7186,16 @@ def request_changes(
             claimed_payload = {}
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+
+        preserve_worker_authority = True
+        if not _identity_can_fence_handoff(
+            task_row["worker_pid"], task_row["worker_identity"],
+        ):
+            return False, (
+                "reviewer authority cannot prove a releasable host/process "
+                "scope; retry after pid, host scope, and group identity are "
+                "persisted"
+            )
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -7144,15 +7229,18 @@ def request_changes(
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
         # breaker counter (mirrors unblock_task, #35072).
+        authority_sql = "" if preserve_worker_authority else """
+                   , claim_lock      = NULL
+                   , claim_expires   = NULL
+                   , worker_pid      = NULL
+                   , worker_identity = NULL
+        """
         cur = conn.execute(
             """
             UPDATE tasks
                SET status = ?,
-                   assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL,
-                   worker_identity = NULL
+                   assignee = COALESCE(?, assignee)
+            """ + authority_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -7378,6 +7466,17 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        fenced = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            fenced is None
+            or fenced["status"] != "review"
+            or fenced["claim_lock"] is not None
+        ):
+            # The dispatcher/reclaim path owns removal of an authority fence.
+            # Reopen must never turn a still-owned review into spawnable work.
+            return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -7414,7 +7513,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
-            + " WHERE id = ? AND status = 'review'",
+            + " WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
             params,
         )
         if cur.rowcount != 1:
@@ -8786,6 +8885,62 @@ def _read_linux_boot_id() -> Optional[str]:
         return None
 
 
+def _read_host_scope_id() -> Optional[str]:
+    """Return a durable discriminator for this machine/PID namespace.
+
+    A hostname is only routing metadata: cloned containers and hosts commonly
+    share one.  Review-handoff release needs stronger proof before absence in
+    the *local* PID namespace can clear authority created elsewhere.
+
+    Linux combines the kernel boot id with the PID-namespace inode so sibling
+    containers on one host cannot approve each other's workers.  macOS has no
+    PID namespaces; its platform UUID identifies the machine.  Unsupported or
+    unreadable platforms return ``None`` and therefore fail closed.
+    """
+    raw: Optional[str] = None
+    if sys.platform == "linux":
+        boot_id = _read_linux_boot_id()
+        try:
+            pid_ns = int(os.stat("/proc/self/ns/pid").st_ino)
+        except (OSError, TypeError, ValueError):
+            pid_ns = 0
+        if boot_id and pid_ns > 0:
+            raw = f"linux:{boot_id}:{pid_ns}"
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/sbin/ioreg", "-rd1", "-c",
+                    "IOPlatformExpertDevice",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', result.stdout)
+            if match:
+                raw = f"darwin:{match.group(1).strip()}"
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raw = None
+    elif sys.platform == "win32":
+        try:
+            import winreg  # type: ignore
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+            ) as key:
+                machine_guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+            if isinstance(machine_guid, str) and machine_guid.strip():
+                raw = f"win32:{machine_guid.strip()}"
+        except (ImportError, OSError, ValueError):
+            raw = None
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def capture_worker_identity(pid: Optional[int]) -> Optional[dict[str, Any]]:
     """Snapshot the immutable birth identity of ``pid``, or None.
 
@@ -8819,7 +8974,7 @@ def capture_worker_identity(pid: Optional[int]) -> Optional[dict[str, Any]]:
             # equal to a missing key — two such records would approve each
             # other. NULL is the honest answer: unprovable, never signalled.
             return None
-        return {
+        identity = {
             "v": WORKER_IDENTITY_VERSION,
             "scheme": "linux_proc",
             "pid": pid,
@@ -8829,12 +8984,14 @@ def capture_worker_identity(pid: Optional[int]) -> Optional[dict[str, Any]]:
             "ppid": parsed["ppid"],
             "boot_id": boot_id,
         }
+        host_scope_id = _read_host_scope_id()
+        if host_scope_id:
+            identity["host_scope_id"] = host_scope_id
+        return identity
 
-    # macOS / BSD / Windows: psutil's creation time is the portable
-    # equivalent. On Windows there are no POSIX sessions, so the identity
-    # carries no sid/pgid and verification authorises a per-PID signal only —
-    # exactly the TerminateProcess behaviour that platform already had, now
-    # gated on a proven creation time instead of a bare PID.
+    # macOS / BSD / Windows: psutil's creation time is the portable birth
+    # value. Preserve the native value exactly: rounding would make two
+    # distinct births compare equal and could authorise a recycled PID.
     try:
         import psutil  # type: ignore
 
@@ -8845,8 +9002,11 @@ def capture_worker_identity(pid: Optional[int]) -> Optional[dict[str, Any]]:
         "v": WORKER_IDENTITY_VERSION,
         "scheme": "create_time",
         "pid": pid,
-        "create_time": round(create_time, 3),
+        "create_time": create_time,
     }
+    host_scope_id = _read_host_scope_id()
+    if host_scope_id:
+        ident["host_scope_id"] = host_scope_id
     getpgid = getattr(os, "getpgid", None)
     getsid = getattr(os, "getsid", None)
     if getpgid is not None and getsid is not None:
@@ -8856,13 +9016,6 @@ def capture_worker_identity(pid: Optional[int]) -> Optional[dict[str, Any]]:
         except (OSError, ValueError):
             return None
     return ident
-
-
-# Tolerance when comparing ``create_time`` epochs (seconds). A recycled PID is
-# born strictly after the process it replaced died, and that process was alive
-# for the whole run we are reclaiming, so any real reuse differs by far more
-# than this; the slack only absorbs float/rounding noise between two reads.
-_CREATE_TIME_EPSILON = 1.0
 
 
 def _coerce_worker_identity(stored: Any) -> Optional[dict[str, Any]]:
@@ -8967,10 +9120,13 @@ def verify_worker_ownership(
             return ("none", "identity_mismatch")
     elif scheme == "create_time":
         try:
-            drift = abs(float(stored["create_time"]) - float(live["create_time"]))
+            stored_create_time = float(stored["create_time"])
+            live_create_time = float(live["create_time"])
         except (KeyError, TypeError, ValueError):
             return ("none", "identity_mismatch")
-        if drift > _CREATE_TIME_EPSILON:
+        # A different birth instant is a different process; PID reuse has no
+        # safe time-neighbourhood in which it can be ignored.
+        if stored_create_time != live_create_time:
             return ("none", "identity_mismatch")
     else:
         return ("none", "identity_scheme_changed")
@@ -9017,6 +9173,224 @@ def _stored_worker_identity(
     if row is None:
         return None
     return row["worker_identity"]
+
+
+def _identity_belongs_to_current_host(stored_identity: Any) -> bool:
+    """Return whether a stored worker identity proves this host scope."""
+    stored = _coerce_worker_identity(stored_identity)
+    current = _read_host_scope_id()
+    stored_scope = stored.get("host_scope_id") if stored else None
+    return bool(
+        current
+        and isinstance(stored_scope, str)
+        and stored_scope.strip()
+        and stored_scope == current
+    )
+
+
+def _identity_can_fence_handoff(
+    pid: Optional[int], stored_identity: Any,
+) -> bool:
+    """Return whether this live worker has a releasable scope identity."""
+    if not pid or int(pid) <= 0:
+        return False
+    stored = _coerce_worker_identity(stored_identity)
+    if not stored or not _identity_belongs_to_current_host(stored):
+        return False
+    try:
+        if int(stored["pid"]) != int(pid):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    mode, _reason = verify_worker_ownership(pid, stored)
+    if hasattr(os, "killpg"):
+        if mode != "group":
+            return False
+        try:
+            return int(stored["pgid"]) == int(pid) == int(stored["sid"])
+        except (KeyError, TypeError, ValueError):
+            return False
+    # A birth-identified PID is not a containment scope. On platforms without
+    # POSIX process groups (notably Windows), descendants may outlive their
+    # leader. Until the dispatcher owns a durable equivalent such as a Job
+    # Object, review handoffs must stay fenced rather than start a second
+    # writer beside an unobservable child.
+    return False
+
+
+def _process_group_has_actionable_member(pgid: int) -> Optional[bool]:
+    """Return whether ``pgid`` contains a non-zombie process, if observable.
+
+    macOS can answer ``EPERM`` to ``killpg(pgid, 0)`` after the dispatcher's
+    group has disappeared. Enumerating the group distinguishes that kernel
+    response from a genuinely live scope. ``None`` means the enumeration was
+    unavailable or incomplete and callers must keep the authority fence.
+    """
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,pgid=,state="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            try:
+                member_pgid = int(fields[1])
+            except ValueError:
+                continue
+            if member_pgid != int(pgid):
+                continue
+            if not fields[2].upper().startswith("Z"):
+                return True
+        return False
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _stored_worker_group_alive(
+    stored_identity: Any, fallback_pid: Optional[int] = None,
+) -> bool:
+    """Return whether a persisted dispatcher process group may still exist.
+
+    This is a signal-0 observation only; it never terminates anything. A
+    malformed POSIX identity is treated as potentially alive because losing
+    proof must not make a task spawnable. Windows has no POSIX process group,
+    so the worker PID is the complete scope available to this implementation.
+    """
+    if not hasattr(os, "killpg"):
+        # No containment proof: the leader may have exited while descendants
+        # remain. Unknown must hold the fence rather than mean "group gone".
+        return True
+    stored = _coerce_worker_identity(stored_identity)
+    if not stored:
+        # The recorded pid is not proof that the worker led a group with the
+        # same number. Guessing and accepting ESRCH would turn missing scope
+        # evidence into permission to spawn a duplicate.
+        return True
+    try:
+        stored_pid = int(stored["pid"])
+        row_pid = int(fallback_pid or 0)
+    except (KeyError, TypeError, ValueError):
+        return True
+    if stored_pid <= 0 or row_pid <= 0 or stored_pid != row_pid:
+        return True
+    if "pgid" not in stored or "sid" not in stored:
+        # Missing persisted group binding is unknown, even when the dispatcher
+        # normally uses start_new_session=True. Do not infer proof from policy.
+        return True
+    try:
+        pgid = int(stored["pgid"])
+        sid = int(stored["sid"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if pgid != stored_pid or sid != stored_pid:
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        observed = _process_group_has_actionable_member(pgid)
+        return True if observed is None else observed
+    except OSError as exc:
+        # ESRCH is 3 on POSIX. Other errors mean the scope exists or cannot
+        # be disproved, so keep the handoff fenced.
+        return getattr(exc, "errno", None) != 3
+    # A group containing only zombies cannot execute or mutate the workspace.
+    # ``killpg(..., 0)`` still reports such a group as existing until its
+    # leaders are reaped, so refine the observation when possible. Any
+    # uncertainty remains fail-closed.
+    observed = _process_group_has_actionable_member(pgid)
+    return True if observed is None else observed
+
+
+def _worker_scope_is_quiescent(
+    stored_identity: Any, pid: Optional[int],
+) -> bool:
+    """Prove that the complete dispatcher-owned worker scope is gone."""
+    if not pid or int(pid) <= 0:
+        return False
+    stored = _coerce_worker_identity(stored_identity)
+    if not stored or not _identity_belongs_to_current_host(stored):
+        return False
+    try:
+        if int(stored["pid"]) != int(pid):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if hasattr(os, "killpg"):
+        return not _stored_worker_group_alive(stored, pid)
+    # Without a persisted containment scope, the leader's death says nothing
+    # about descendants. Unknown must remain fenced rather than be treated as
+    # quiescent (Windows needs a durable Job Object or equivalent first).
+    return False
+
+
+def _release_quiesced_review_handoffs(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """Release review-cycle claims only after the prior scope is gone.
+
+    Implementers and reviewers request their handoff from inside their own
+    process, so neither can safely kill its process group during the tool call.
+    Both transitions keep the claim/PID/birth proof as a fence. Each dispatcher
+    tick reaps exited children first, then calls this helper; only a dead leader
+    with no surviving persisted process group makes the next lane spawnable.
+    """
+    released: list[str] = []
+    rows = conn.execute(
+        "SELECT id, claim_lock, worker_pid, worker_identity "
+        "FROM tasks WHERE status IN ('review', 'ready', 'todo') "
+        "AND claim_lock IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        pid = row["worker_pid"]
+        stored_identity = row["worker_identity"]
+        claim_lock = row["claim_lock"]
+        if not pid:
+            # A live claim without a recorded worker has no scope proof. It
+            # requires explicit recovery rather than an unsafe auto-release.
+            continue
+        # Hostname equality is not ownership proof. The worker birth record
+        # must bind the claim to this exact machine/PID namespace before any
+        # local pid/group absence can authorise release.
+        mode, reason = verify_worker_ownership(pid, stored_identity)
+        if mode != "none":
+            continue
+        if _pid_alive(pid) and reason != "identity_mismatch":
+            continue
+        if not _worker_scope_is_quiescent(stored_identity, pid):
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_identity = NULL "
+                "WHERE id = ? AND status IN ('review', 'ready', 'todo') "
+                "AND claim_lock IS ? "
+                "AND worker_pid IS ?",
+                (row["id"], claim_lock, pid),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "review_handoff_quiesced",
+                {
+                    "prev_lock": claim_lock,
+                    "prev_pid": int(pid),
+                    "ownership_reason": reason,
+                },
+                run_id=_current_run_id(conn, row["id"]),
+            )
+        released.append(row["id"])
+    return released
 
 
 def _dispatcher_owned_pgid(pid: int) -> Optional[int]:
@@ -9153,12 +9527,12 @@ def _terminate_reclaimed_worker(
         info["ownership_reason"] = "no_pid_or_lock"
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
-        # Remote claim. We could not signal it correctly even if we wanted to
-        # — the PID names a process on another host — so this is not an
-        # ownership failure, and the caller releases as before.
-        info["ownership_reason"] = "remote_claim"
+    if not _identity_belongs_to_current_host(stored_identity):
+        # A hostname never proves a PID namespace. Missing or mismatched host
+        # scope holds every reclaim path, including ordinary running tasks.
+        info["ownership"] = "unproven"
+        info["ownership_unproven"] = True
+        info["ownership_reason"] = "host_scope_unproven"
         return info
     info["host_local"] = True
 
@@ -9168,11 +9542,13 @@ def _terminate_reclaimed_worker(
     info["ownership_reason"] = reason
     if mode == "none":
         if not _pid_alive(pid):
-            # Unprovable because there is nothing left to prove: the pid is
-            # gone. No signal is needed and no duplicate can be spawned beside
-            # it, so this is a successful termination, not a refusal.
-            info["ownership_reason"] = "already_dead"
-            info["terminated"] = True
+            if _worker_scope_is_quiescent(stored_identity, pid):
+                info["ownership_reason"] = "already_dead"
+                info["terminated"] = True
+            else:
+                info["ownership"] = "unproven"
+                info["ownership_unproven"] = True
+                info["ownership_reason"] = "worker_scope_not_quiescent"
             return info
         # Live, host-local, and NOT provably ours. This is the case the whole
         # section exists for. Signal nothing and say so loudly: the caller
@@ -9186,7 +9562,37 @@ def _terminate_reclaimed_worker(
             int(pid), reason,
         )
         return info
+    if mode != "group":
+        # Per-PID ownership does not prove the whole execution scope. Killing
+        # only a Windows leader can leave descendants writing to the same
+        # workspace, so do not signal or release until the platform supplies
+        # a durable containment primitive (for example a Job Object).
+        info["ownership"] = "unproven"
+        info["ownership_unproven"] = True
+        info["ownership_reason"] = "worker_scope_uncontained"
+        return info
     info["ownership"] = "proven"
+
+    def _scope_quiescent() -> bool:
+        """Check the containment scope without escaping injected test hooks.
+
+        Production uses the persisted process-group proof. Tests that inject a
+        signal function deliberately model a synthetic PID and must never probe
+        the host's real process group with that number.
+        """
+        if signal_fn is not None or killpg_fn is not None:
+            return not _pid_alive(pid)
+        return _worker_scope_is_quiescent(stored_identity, pid)
+
+    def _wait_for_scope_quiescence() -> bool:
+        # A signalled descendant can remain observable briefly after its
+        # leader exits. Keep the claim fenced during that drain rather than
+        # reporting a false failure or, worse, releasing early.
+        for _ in range(20):
+            if _scope_quiescent():
+                return True
+            time.sleep(0.1)
+        return _scope_quiescent()
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -9201,7 +9607,6 @@ def _terminate_reclaimed_worker(
         killpg = getattr(os, "killpg", None)
     else:
         killpg = None
-    # ``mode == "pid"`` is Windows, which has no POSIX groups at all.
     pgid = (
         _dispatcher_owned_pgid(int(pid))
         if (killpg is not None and mode == "group") else None
@@ -9225,17 +9630,20 @@ def _terminate_reclaimed_worker(
     try:
         _send(signal.SIGTERM, pgid)
     except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
-        info["terminated"] = True
+        info["terminated"] = _wait_for_scope_quiescence()
+        if not info["terminated"]:
+            info["ownership_unproven"] = True
+            info["ownership_reason"] = "worker_scope_not_quiescent"
         return info
     except OSError:
         return info
 
     for _ in range(10):
         if not _pid_alive(pid):
-            info["terminated"] = True
+            info["terminated"] = _wait_for_scope_quiescence()
+            if not info["terminated"]:
+                info["ownership_unproven"] = True
+                info["ownership_reason"] = "worker_scope_not_quiescent"
             return info
         time.sleep(0.5)
 
@@ -9258,10 +9666,14 @@ def _terminate_reclaimed_worker(
         )
         if mode == "none":
             if not _pid_alive(pid):
-                # It exited between the check and the re-probe. Nothing to
-                # escalate to and nothing left to prove.
-                info["ownership_reason"] = "already_dead"
-                info["terminated"] = True
+                info["terminated"] = _wait_for_scope_quiescence()
+                info["ownership_reason"] = (
+                    "already_dead"
+                    if info["terminated"]
+                    else "worker_scope_not_quiescent"
+                )
+                if not info["terminated"]:
+                    info["ownership_unproven"] = True
                 return info
             # Alive, and no longer provably ours. Send NOTHING. The receipt
             # says exactly which stage refused so an operator can tell this
@@ -9300,7 +9712,10 @@ def _terminate_reclaimed_worker(
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = _wait_for_scope_quiescence()
+    if not info["terminated"] and not _pid_alive(pid):
+        info["ownership_unproven"] = True
+        info["ownership_reason"] = "worker_scope_not_quiescent"
     return info
 
 
@@ -9309,9 +9724,9 @@ def _worker_survived_termination(termination: dict) -> bool:
 
     Reclaiming in this state would release the claim and let the dispatcher
     spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    loop. Only host-local workers we actually signalled count here; remote or
+    otherwise unproven authority is held separately by
+    :func:`_reclaim_hold_reason`.
 
     This covers only the *signalled but alive* case. Reclaim call sites use
     :func:`_reclaim_hold_reason`, which also holds when ownership could not be
@@ -9351,14 +9766,15 @@ def _reclaim_hold_reason(termination: dict) -> Optional[str]:
         We proved ownership, signalled, and the worker is *still* alive
         (the cgroup-throttle / uninterruptible-D case). Same rule.
 
-    Remote claims are never held: their worker is not ours to manage.
+    A remote-looking claim is also held. Hostnames are mutable, so without a
+    stronger machine proof it may be a local worker created before a rename.
     """
-    if not termination.get("host_local"):
-        return None
     if termination.get("escalation_ownership_unproven"):
         return "escalation_ownership_unproven"
     if termination.get("ownership_unproven"):
         return "ownership_unproven"
+    if not termination.get("host_local"):
+        return None
     if _worker_survived_termination(termination):
         return "worker_alive"
     return None
@@ -9398,7 +9814,9 @@ def _defer_reclaim_for_live_worker(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            "WHERE id = ? "
+            "AND status IN ('running', 'review', 'ready', 'blocked', 'todo') "
+            "AND claim_lock IS ?",
             (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
@@ -10021,11 +10439,11 @@ def reconcile_orphaned_running(
     ``detect_stale_running`` is disabled by default — so the card shows
     Running forever (a zombie).
 
-    This pass finds those orphans, requeues them to ``ready`` with an
-    explanatory comment, closes any leaked run, and appends a
-    ``reconciled`` event. If the orphan row still records a live PID on
-    this host, requeueing is deferred to a later tick so we never spawn a
-    duplicate beside a possibly-alive worker.
+    This pass finds those orphans, but requeues them only after the persisted
+    host/process-group identity proves the complete prior worker scope is
+    quiescent. A dead or recycled leader PID is not enough: descendants may
+    still hold the workspace. Unknown, cross-host, legacy, or still-live
+    scopes keep their authority and emit ``reclaim_deferred`` instead.
 
     Returns the list of reconciled task ids. Safe to call every tick.
 
@@ -10034,24 +10452,36 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_identity "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if (
-            pid and _pid_alive(pid)
-            and not _identity_contradicts_liveness(conn, tid, pid)
-        ):
-            # The recorded worker may still be doing real work — never
-            # requeue beside a live process. Retry next tick. A pid whose
-            # birth identity is contradicted is NOT that worker, so it does
-            # not hold the card hostage.
+        stored_identity = row["worker_identity"]
+        if not _worker_scope_is_quiescent(stored_identity, pid):
+            host_local = _identity_belongs_to_current_host(stored_identity)
+            termination = {
+                "termination_attempted": False,
+                "host_local": host_local,
+                "terminated": False,
+                "ownership_unproven": not host_local,
+                "ownership_reason": "worker_scope_not_quiescent",
+            }
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="orphaned_running_scope_not_quiescent",
+            )
             _log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
-                "pid %s is alive on this host — deferring", tid, pid,
+                "its prior worker scope is not proven quiescent — deferring",
+                tid,
             )
             continue
         with write_txn(conn):
@@ -10060,8 +10490,15 @@ def reconcile_orphaned_running(
                 "claim_expires = NULL, worker_pid = NULL, worker_identity = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                "  AND claim_lock IS ? AND claim_expires IS ? "
+                "  AND worker_pid IS ? AND worker_identity IS ?",
+                (
+                    tid,
+                    row["claim_lock"],
+                    row["claim_expires"],
+                    row["worker_pid"],
+                    row["worker_identity"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -10227,15 +10664,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_identity, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+            # Hostnames are mutable routing labels, not ownership proof. Only
+            # the persisted machine/PID-namespace identity can establish that
+            # this dispatcher is allowed to interpret the worker's pid/group.
+            stored_identity = row["worker_identity"]
+            if not _identity_belongs_to_current_host(stored_identity):
                 continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
@@ -10258,6 +10696,41 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 pid_recycled = True
 
             pid = int(row["worker_pid"])
+            if not _worker_scope_is_quiescent(stored_identity, pid):
+                # A dead/recycled leader does not prove its descendants are
+                # gone. Keep the claim fenced so the next dispatcher tick
+                # cannot spawn a second writer beside the surviving group.
+                grace = int(time.time()) + RECLAIM_DEFER_GRACE_SECONDS
+                cur = conn.execute(
+                    "UPDATE tasks SET claim_expires = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND worker_pid = ? AND claim_lock IS ?",
+                    (grace, row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount == 1:
+                    run_id = _current_run_id(conn, row["id"])
+                    if run_id is not None:
+                        conn.execute(
+                            "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                            (grace, run_id),
+                        )
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "reclaim_deferred",
+                        {
+                            "reason": "ownership_unproven",
+                            "trigger": "crash_detection_worker_scope_alive",
+                            "claim_lock": row["claim_lock"],
+                            "claim_expires_now": grace,
+                            "host_local": True,
+                            "ownership_unproven": True,
+                            "ownership_reason": "worker_scope_not_quiescent",
+                            "worker_pid": pid,
+                        },
+                        run_id=run_id,
+                    )
+                continue
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             if kind == "clean_exit":
@@ -11128,7 +11601,11 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Return the number of tasks currently in ``status='running'``.
+    """Return the number of task process scopes currently in flight.
+
+    This includes review handoffs whose implementer claim remains fenced until
+    its process group exits. Counting only ``status='running'`` there would
+    violate the host concurrency cap during the handoff window.
 
     Used by the gateway's multi-board sweep to account for workers on
     OTHER boards against the host-level concurrency budget (OOF-30): the
@@ -11140,11 +11617,51 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+                "OR (status IN ('review', 'ready', 'todo') "
+                "AND claim_lock IS NOT NULL)"
             ).fetchone()[0]
         )
     except Exception:
         return 0
+
+
+def _count_inflight_tasks_by_profile(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    """Count process scopes against the profile that actually owns them.
+
+    During a review handoff ``tasks.assignee`` already names the *next* lane,
+    while the retained claim still belongs to the profile recorded on the
+    just-ended run. Charging the next assignee would let another process for
+    the prior profile spawn past its cap. The latest run is authoritative for
+    a retained fence; ordinary running tasks continue to use their assignee.
+    """
+    counts: dict[str, int] = {}
+    rows = conn.execute(
+        "SELECT t.status, t.assignee, t.claim_lock, "
+        "(SELECT tr.profile FROM task_runs tr "
+        " WHERE tr.task_id = t.id ORDER BY tr.id DESC LIMIT 1) "
+        "AS retained_profile "
+        "FROM tasks t WHERE t.status = 'running' "
+        "OR (t.status IN ('review', 'ready', 'todo') "
+        "AND t.claim_lock IS NOT NULL)"
+    ).fetchall()
+    for row in rows:
+        profile = (
+            row["assignee"]
+            if row["status"] == "running"
+            else row["retained_profile"]
+        )
+        if not isinstance(profile, str) or not profile.strip():
+            # Legacy/inconsistent retained rows have no authoritative prior
+            # profile. Counting them against the next assignee is safer than
+            # ignoring the process entirely, while valid handoffs always have
+            # a run profile and take the branch above.
+            profile = row["assignee"]
+        if isinstance(profile, str) and profile.strip():
+            counts[profile] = counts.get(profile, 0) + 1
+    return counts
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
@@ -11357,6 +11874,11 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    # A worker requests review from inside its own process. The request keeps
+    # the old claim as a fence; only after the leader and process group are
+    # observably gone can this tick expose the card to the review lane.
+    _release_quiesced_review_handoffs(conn)
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
@@ -11523,12 +12045,7 @@ def _dispatch_once_locked(
     ) else None
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+        _per_profile_running = _count_inflight_tasks_by_profile(conn)
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.

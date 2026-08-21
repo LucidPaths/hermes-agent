@@ -11,6 +11,7 @@ These tests cover the two review models that must coexist:
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -21,7 +22,24 @@ from hermes_cli import kanban_diagnostics as kd
 
 
 @pytest.fixture
-def conn(tmp_path: Path):
+def conn(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "capture_worker_identity",
+        lambda pid: {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": int(pid),
+            "create_time": 1000.0,
+            "pgid": int(pid),
+            "sid": int(pid),
+            "host_scope_id": kb._read_host_scope_id(),
+        },
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda _identity, _pid=None: False,
+    )
     db = kb.connect(tmp_path / "kanban.db")
     try:
         yield db
@@ -35,6 +53,58 @@ def _event(events, kind: str):
 
 def _run(runs, outcome: str):
     return [run for run in runs if run.outcome == outcome][-1]
+
+
+def _persist_test_worker_identity(conn, task_id: str, pid: int = 987654) -> None:
+    identity = {
+        "v": kb.WORKER_IDENTITY_VERSION,
+        "scheme": "create_time",
+        "pid": pid,
+        "create_time": 1000.0,
+        "pgid": pid,
+        "sid": pid,
+        "host_scope_id": kb._read_host_scope_id(),
+    }
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_identity = ? WHERE id = ?",
+            (pid, json.dumps(identity), task_id),
+        )
+
+
+def _clear_test_handoff(conn, task_id: str, statuses: tuple[str, ...]) -> None:
+    placeholders = ",".join("?" for _ in statuses)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_identity = NULL "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            (task_id, *statuses),
+        )
+
+
+def _request_review_and_exit(conn, task_id, **kwargs):
+    row = conn.execute(
+        "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row and row["claim_lock"] is not None and row["worker_pid"] is None:
+        _persist_test_worker_identity(conn, task_id)
+    result = kb.request_review(conn, task_id, **kwargs)
+    if result is True or (isinstance(result, tuple) and result[0] is True):
+        _clear_test_handoff(conn, task_id, ("review",))
+    return result
+
+
+def _request_changes_and_exit(conn, task_id, **kwargs):
+    row = conn.execute(
+        "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row and row["claim_lock"] is not None and row["worker_pid"] is None:
+        _persist_test_worker_identity(conn, task_id)
+    result = kb.request_changes(conn, task_id, **kwargs)
+    if result[0] is True:
+        _clear_test_handoff(conn, task_id, ("ready", "todo"))
+    return result
 
 
 def _claimed_review(
@@ -52,7 +122,7 @@ def _claimed_review(
     )
     implementation = kb.claim_task(conn, task_id, claimer="builder:test")
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         summary="ready for independent review",
@@ -65,6 +135,7 @@ def _claimed_review(
         ttl_seconds=ttl_seconds,
     )
     assert review is not None
+    _persist_test_worker_identity(conn, task_id)
     return task_id, review
 
 
@@ -73,7 +144,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
 
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         reviewer="reviewer",
@@ -99,7 +170,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
-    assert kb.request_changes(
+    assert _request_changes_and_exit(
         conn,
         task_id,
         reason="Add a regression for the fallback branch.",
@@ -120,7 +191,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
 
     implementation_2 = kb.claim_task(conn, task_id, claimer="builder:2")
     assert implementation_2 is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         summary="Fallback regression added.",
@@ -155,7 +226,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     bad_payload: str | None,
 ) -> None:
     task_id, review = _claimed_review(conn, "Malformed reviewer provenance")
-    assert kb.request_changes(
+    assert _request_changes_and_exit(
         conn,
         task_id,
         reason="Correct the implementation.",
@@ -179,7 +250,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
 
     implementation = kb.claim_task(conn, task_id, claimer="builder:retry")
     assert implementation is not None
-    assert not kb.request_review(
+    assert not _request_review_and_exit(
         conn,
         task_id,
         summary="Corrected implementation.",
@@ -190,7 +261,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     assert unchanged.status == "running"
     assert unchanged.assignee == "builder"
 
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         reviewer="reviewer",
@@ -217,7 +288,7 @@ def test_review_changes_reapply_parent_gate(conn):
     assert kb.complete_task(conn, parent_id)
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         reviewer="reviewer",
@@ -229,7 +300,7 @@ def test_review_changes_reapply_parent_gate(conn):
     conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
     conn.commit()
 
-    assert kb.request_changes(
+    assert _request_changes_and_exit(
         conn,
         task_id,
         reason="Parent contract changed; rework after it lands.",
@@ -238,6 +309,89 @@ def test_review_changes_reapply_parent_gate(conn):
     regated = kb.get_task(conn, task_id)
     assert regated is not None
     assert regated.status == "todo"
+
+
+def test_todo_review_handoff_reclaim_preserves_the_parent_gate(conn, monkeypatch):
+    parent_id = kb.create_task(conn, title="Parent contract", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    task_id = kb.create_task(
+        conn,
+        title="Dependent review rework",
+        assignee="builder",
+        parents=[parent_id],
+    )
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    assert _request_review_and_exit(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        summary="Ready for review.",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    _persist_test_worker_identity(conn, task_id, 987655)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Parent changed; rework must wait.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+    retained = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assert retained["status"] == "todo"
+    assert retained["claim_lock"] is not None
+
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": False,
+        },
+    )
+    assert not kb.reclaim_task(
+        conn,
+        task_id,
+        reason="reviewer scope still alive",
+        signal_fn=lambda *_args: None,
+    )
+    deferred = _event(kb.list_events(conn, task_id), "reclaim_deferred")
+    assert deferred.payload["trigger"] == "manual_reclaim_worker_scope_alive"
+    still_retained = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assert still_retained["status"] == "todo"
+    assert still_retained["claim_lock"] is not None
+
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+        },
+    )
+    monkeypatch.setattr(kb, "_worker_scope_is_quiescent", lambda *_args: True)
+    assert kb.reclaim_task(
+        conn,
+        task_id,
+        reason="reviewer scope exited",
+        signal_fn=lambda *_args: None,
+    )
+    released = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assert released["status"] == "todo"
+    assert released["claim_lock"] is None
+    assert kb.claim_task(conn, task_id) is None
 
 
 def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
@@ -253,7 +407,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     assert implementation is not None
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
-    assert not kb.request_review(
+    assert not _request_review_and_exit(
         conn,
         task_id,
         summary="must wait",
@@ -263,7 +417,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     assert still_running is not None
     assert still_running.status == "running"
     assert kb.complete_task(conn, parent_id)
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         summary="parent stable",
@@ -279,7 +433,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     task_id = kb.create_task(conn, title="Malformed handoff", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         reviewer="reviewer",
@@ -295,7 +449,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
 
-    ok, detail = kb.request_changes(
+    ok, detail = _request_changes_and_exit(
         conn,
         task_id,
         reason="Needs changes.",
@@ -352,9 +506,14 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE tasks SET claim_expires = ? WHERE id = ?",
                 (int(time.time()) - 1, task_id),
             )
-        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(
+            conn, signal_fn=lambda *_args: None,
+        ) == 1
     elif reclaim_kind == "manual_reclaim":
-        assert kb.reclaim_task(conn, task_id, reason="operator retry")
+        assert kb.reclaim_task(
+            conn, task_id, reason="operator retry",
+            signal_fn=lambda *_args: None,
+        )
     else:
         old = int(time.time()) - 1_000
         with kb.write_txn(conn):
@@ -367,7 +526,10 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE task_runs SET started_at = ? WHERE id = ?",
                 (old, review.current_run_id),
             )
-        assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=1,
+            signal_fn=lambda *_args: None,
+        ) == [task_id]
 
     retried = kb.get_task(conn, task_id)
     assert retried is not None
@@ -427,7 +589,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     )
     implementation = kb.claim_task(conn, task_id)
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         summary="ready",
@@ -467,6 +629,7 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
         "Timeout during review",
         max_runtime_seconds=1,
     )
+    _persist_test_worker_identity(conn, timed_out_id, 999_998)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
@@ -482,6 +645,7 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
     assert timed_out.status == "review"
 
     crashed_id, crashed_run = _claimed_review(conn, "Crash during review")
+    _persist_test_worker_identity(conn, crashed_id, 999_999)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
@@ -501,7 +665,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
     task_id = kb.create_task(conn, title="Goal handoff race", assignee="builder")
     implementation = kb.claim_task(conn, task_id)
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn,
         task_id,
         summary="ready",
@@ -514,7 +678,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
         conn, task_id, implementation.current_run_id
     ) == "review"
 
-    assert kb.request_changes(
+    assert _request_changes_and_exit(
         conn,
         task_id,
         reason="fix it",
@@ -542,7 +706,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
-    assert kb.request_review(conn, task_id, summary="implementation handoff")
+    assert _request_review_and_exit(conn, task_id, summary="implementation handoff")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
     assert completed_event.run_id is not None
@@ -662,7 +826,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
 
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn, task_id, summary="v1", reviewer="reviewer",
         expected_run_id=implementation.current_run_id,
     )
@@ -670,7 +834,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
 
     review = kb.claim_review_task(conn, task_id)
     assert review is not None
-    assert kb.request_changes(
+    assert _request_changes_and_exit(
         conn, task_id, reason="needs fixes",
         expected_run_id=review.current_run_id,
     ) == (True, "builder")
@@ -678,7 +842,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
 
     retry = kb.claim_task(conn, task_id, claimer="builder:2")
     assert retry is not None
-    assert kb.request_review(
+    assert _request_review_and_exit(
         conn, task_id, summary="v2",
         expected_run_id=retry.current_run_id,
     )

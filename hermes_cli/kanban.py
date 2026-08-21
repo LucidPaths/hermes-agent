@@ -683,8 +683,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_review.add_argument(
         "--force", action="store_true",
         help=(
-            "Override the live-claim guard: move a running, claimed task to "
-            "review even without owning its run (clears the worker's claim)."
+            "Deprecated compatibility flag. It does not override retained "
+            "worker authority; a running worker must prove its run ownership."
         ),
     )
 

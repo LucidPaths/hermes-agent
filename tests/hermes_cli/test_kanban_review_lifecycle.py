@@ -35,6 +35,19 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        kb,
+        "capture_worker_identity",
+        lambda pid: {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": int(pid),
+            "create_time": 1000.0,
+            "pgid": int(pid),
+            "sid": int(pid),
+            "host_scope_id": kb._read_host_scope_id(),
+        },
+    )
     kb.init_db()
     return home
 
@@ -69,6 +82,45 @@ def _last_run(conn, tid):
     ).fetchone()
 
 
+def _request_review_and_exit(conn, task_id, **kwargs):
+    """Model a normal dispatcher worker that exits after requesting review.
+
+    Legacy lifecycle tests care about the semantic review cycle, not the
+    process fence. Persist a valid synthetic birth record before the tool call,
+    then clear the fence to represent the dispatcher observing that worker's
+    completed exit. Dedicated progress-lease tests exercise the live fence.
+    """
+    row = conn.execute(
+        "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row and row["claim_lock"] is not None and row["worker_pid"] is None:
+        identity = {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": 987654,
+            "create_time": 1000.0,
+            "pgid": 987654,
+            "sid": 987654,
+            "host_scope_id": kb._read_host_scope_id(),
+        }
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_identity = ? "
+                "WHERE id = ?",
+                (987654, json.dumps(identity), task_id),
+            )
+    result = kb.request_review(conn, task_id, **kwargs)
+    if result is True or (isinstance(result, tuple) and result[0] is True):
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_identity = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Happy path: running -> review
 # ---------------------------------------------------------------------------
@@ -81,7 +133,7 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         run_id = kb.get_task(conn, tid).current_run_id
         assert run_id is not None
 
-        ok = kb.request_review(
+        ok = _request_review_and_exit(
             conn, tid,
             summary="Implementation complete\nfull details below",
             reviewer="reviewer",
@@ -140,7 +192,7 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
                 assert claimed is not None
 
             run_id = kb.get_task(conn, tid).current_run_id
-            ok = kb.request_review(
+            ok = _request_review_and_exit(
                 conn, tid,
                 summary="pass complete",
                 expected_run_id=run_id,
@@ -168,7 +220,7 @@ def test_request_review_expected_run_id_mismatch_is_noop(kanban_home: Path) -> N
         real_run = kb.get_task(conn, tid).current_run_id
 
         # A superseded worker passes a run id that is not the current one.
-        ok = kb.request_review(conn, tid, expected_run_id=(real_run or 0) + 999)
+        ok = _request_review_and_exit(conn, tid, expected_run_id=(real_run or 0) + 999)
         assert ok is False
         # Task is untouched — still running under the real run.
         row = _row(conn, tid)
@@ -179,7 +231,7 @@ def test_request_review_expected_run_id_mismatch_is_noop(kanban_home: Path) -> N
 
 def test_request_review_unknown_task_returns_false(kanban_home: Path) -> None:
     with kb.connect() as conn:
-        assert kb.request_review(conn, "t_deadbeefcafe") is False
+        assert _request_review_and_exit(conn, "t_deadbeefcafe") is False
 
 
 def test_request_review_refuses_to_clear_live_claim_without_ownership(
@@ -187,10 +239,9 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
 ) -> None:
     """M1 regression: a run-id-less caller must not steal a live worker's claim.
 
-    ``request_review`` on a running+claimed task without ``expected_run_id``
-    fails with a distinct reason instead of silently NULLing claim_lock /
-    worker_pid. ``force=True`` (explicit human override) and the worker path
-    (``expected_run_id=<own run>``) both still work.
+    ``request_review`` on a running+claimed task fails closed until both the
+    caller's run id and a persisted PID/birth identity establish a handoff
+    fence. ``force=True`` is intent, not a fencing primitive.
     """
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="live claim", assignee="worker")
@@ -200,7 +251,7 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
         # 1) No run id, no force -> refused with a distinct reason.
         ok, reason = kb.request_review(conn, tid, with_reason=True)
         assert ok is False
-        assert reason is not None and "live claim" in reason
+        assert reason is not None and "incomplete worker authority" in reason
         row = conn.execute(
             "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (tid,),
@@ -210,18 +261,25 @@ def test_request_review_refuses_to_clear_live_claim_without_ownership(
         # bool-mode caller sees plain False.
         assert kb.request_review(conn, tid) is False
 
-        # 2) Worker path: proving ownership via expected_run_id works.
+        # 2) A run id without persisted process identity is also refused.
         assert kb.request_review(
+            conn, tid, summary="too early",
+            expected_run_id=claimed.current_run_id,
+        ) is False
+
+        # Once the dispatcher has persisted PID + birth identity, the normal
+        # worker path succeeds; the helper models its subsequent clean exit.
+        assert _request_review_and_exit(
             conn, tid, summary="done", expected_run_id=claimed.current_run_id,
         ) is True
         assert kb.get_task(conn, tid).status == "review"
 
-    # 3) force=True: explicit human override on a fresh live-claimed task.
+    # 3) force=True cannot clear an incomplete live claim.
     with kb.connect() as conn:
         tid2 = kb.create_task(conn, title="forced", assignee="worker")
         assert kb.claim_task(conn, tid2) is not None
-        assert kb.request_review(conn, tid2, summary="override", force=True) is True
-        assert kb.get_task(conn, tid2).status == "review"
+        assert kb.request_review(conn, tid2, summary="override", force=True) is False
+        assert kb.get_task(conn, tid2).status == "running"
 
 
 def test_request_review_malformed_provenance_gets_distinct_reason(
@@ -232,15 +290,36 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="provenance", assignee="builder")
         claimed = kb.claim_task(conn, tid)
-        assert kb.request_review(
+        assert _request_review_and_exit(
             conn, tid, summary="v1", reviewer="reviewer",
             expected_run_id=claimed.current_run_id,
         )
         review = kb.claim_review_task(conn, tid)
         assert review is not None
+        identity = {
+            "v": kb.WORKER_IDENTITY_VERSION,
+            "scheme": "create_time",
+            "pid": 987655,
+            "create_time": 1000.0,
+            "pgid": 987655,
+            "sid": 987655,
+            "host_scope_id": kb._read_host_scope_id(),
+        }
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_identity = ? "
+                "WHERE id = ?",
+                (987655, json.dumps(identity), tid),
+            )
         assert kb.request_changes(
             conn, tid, reason="fix", expected_run_id=review.current_run_id,
         ) == (True, "builder")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_identity = NULL WHERE id = ?",
+                (tid,),
+            )
         # Corrupt the changes_requested payload so re-review cannot recover
         # the prior reviewer.
         with kb.write_txn(conn):
@@ -251,14 +330,14 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
             )
         retry = kb.claim_task(conn, tid, claimer="builder:retry")
         assert retry is not None
-        ok, reason = kb.request_review(
+        ok, reason = _request_review_and_exit(
             conn, tid, summary="v2",
             expected_run_id=retry.current_run_id, with_reason=True,
         )
         assert ok is False
         assert reason is not None and "provenance" in reason
         # Passing reviewer explicitly recovers, as the reason instructs.
-        assert kb.request_review(
+        assert _request_review_and_exit(
             conn, tid, summary="v2", reviewer="reviewer",
             expected_run_id=retry.current_run_id,
         ) is True
@@ -284,7 +363,7 @@ def test_request_review_whitespace_only_summary_does_not_crash(
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
 
-        ok = kb.request_review(conn, tid, summary=blank, expected_run_id=run_id)
+        ok = _request_review_and_exit(conn, tid, summary=blank, expected_run_id=run_id)
         assert ok is True
         assert kb.get_task(conn, tid).status == "review"
 
@@ -306,7 +385,7 @@ def test_complete_task_closes_review_to_done(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="approve me", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="ready",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -342,7 +421,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             thread_id="T1",
         )
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="please review",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -385,7 +464,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="park", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="done",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -441,7 +520,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
-        assert kb.request_review(
+        assert _request_review_and_exit(
             conn, review_id, summary="PR ready",
             expected_run_id=claimed.current_run_id,
         )
@@ -502,7 +581,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
-        assert kb.request_review(
+        assert _request_review_and_exit(
             conn,
             task_id,
             summary="ready",
@@ -551,7 +630,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             task_id = kb.create_task(conn, title=title, assignee="reviewer")
             implementation = kb.claim_task(conn, task_id)
             assert implementation is not None
-            assert kb.request_review(
+            assert _request_review_and_exit(
                 conn,
                 task_id,
                 summary="ready",
@@ -608,7 +687,7 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="reopen me", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="v1", reviewer="reviewer",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -641,7 +720,7 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
 
         # Pass 1: implement -> review.
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="v1",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -651,7 +730,7 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
         assert kb.reopen_review_task(conn, tid) is True
         assert kb.get_task(conn, tid).status == "ready"
         kb.claim_task(conn, tid)
-        kb.request_review(
+        _request_review_and_exit(
             conn, tid, summary="v2",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
@@ -679,7 +758,7 @@ def test_request_review_on_unclaimed_ready_synthesizes_run(kanban_home: Path) ->
         assert kb.get_task(conn, tid).status == "ready"
         assert kb.get_task(conn, tid).current_run_id is None
 
-        ok = kb.request_review(conn, tid, summary="done without a claim")
+        ok = _request_review_and_exit(conn, tid, summary="done without a claim")
         assert ok is True
         assert kb.get_task(conn, tid).status == "review"
 
@@ -699,7 +778,7 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         tid = kb.create_task(conn, title="route reviewer", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
-        ok = kb.request_review(
+        ok = _request_review_and_exit(
             conn, tid, summary="v1", reviewer="lead-reviewer",
             expected_run_id=claimed.current_run_id,
         )

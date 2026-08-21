@@ -39,6 +39,7 @@ from hermes_cli import kanban_db as kb
 # Captured before any fixture stubs it, so the real-process tests below can
 # put the genuine /proc reader back without unwinding the rest of the fixture.
 _REAL_CAPTURE_WORKER_IDENTITY = kb.capture_worker_identity
+_TEST_HOST_SCOPE = kb._read_host_scope_id() or "host-scope-under-test"
 
 
 def _fake_identity(pid, **overrides):
@@ -58,6 +59,7 @@ def _fake_identity(pid, **overrides):
         "sid": int(pid),
         "ppid": 1,
         "boot_id": "0000-boot-under-test",
+        "host_scope_id": _TEST_HOST_SCOPE,
     }
     ident.update(overrides)
     return ident
@@ -82,6 +84,9 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(
         kb, "capture_worker_identity", lambda pid: _fake_identity(pid),
+    )
+    monkeypatch.setattr(
+        kb, "_read_host_scope_id", lambda: _TEST_HOST_SCOPE,
     )
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -802,13 +807,21 @@ def test_no_progress_reclaim_of_a_review_run_resumes_in_review(
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="review-me", assignee="a")
         impl = kb.claim_task(conn, tid, claimer=f"{host}:impl")
-        assert kb.request_review(
+        kb._set_worker_pid(conn, tid, 4242)
+        res = kb.request_review(
             conn, tid, summary="done", reviewer="rev",
             expected_run_id=impl.current_run_id,
         ) is True
+        monkeypatch.setattr(kb, "capture_worker_identity", lambda _pid: None)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb, "_stored_worker_group_alive", lambda _ident, _pid=None: False,
+        )
+        assert kb._release_quiesced_review_handoffs(conn) == [tid]
         assert kb.claim_review_task(
             conn, tid, claimer=f"{host}:reviewer",
         ) is not None
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
         kb._set_worker_pid(conn, tid, 4242)
         _age_progress(conn, tid, 7200)
 
@@ -1012,13 +1025,9 @@ def test_terminate_falls_back_when_the_group_cannot_be_resolved(monkeypatch):
     assert pid_sent and info["process_group"] is False
 
 
-def test_windows_termination_stays_per_pid(monkeypatch):
-    """Windows has no POSIX process groups here; ``os.killpg``/``os.getpgid``
-    are absent. Behaviour must be exactly what it was before this change —
-    a per-pid TerminateProcess — except that the pid must now carry a proven
-    creation time, which is Windows' equivalent birth stamp."""
+def test_windows_pid_proof_does_not_release_an_uncontained_scope(monkeypatch):
+    """A Windows PID proves the leader, not descendants that may outlive it."""
     import os as _os
-    import signal as _signal
 
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     monkeypatch.delattr(_os, "getpgid", raising=False)
@@ -1029,6 +1038,7 @@ def test_windows_termination_stays_per_pid(monkeypatch):
         "scheme": "create_time",
         "pid": 4242,
         "create_time": 1_700_000_000.5,
+        "host_scope_id": kb._read_host_scope_id(),
     }
 
     host = kb._claimer_id().split(":", 1)[0]
@@ -1039,9 +1049,13 @@ def test_windows_termination_stays_per_pid(monkeypatch):
         signal_fn=sig_fn,
     )
 
-    assert pid_sent == [(4242, _signal.SIGTERM)]
+    assert pid_sent == []
     assert info["process_group"] is False
-    assert info["ownership"] == "proven"
+    assert info["ownership"] == "unproven"
+    assert info["ownership_reason"] == "worker_scope_uncontained"
+    assert info["ownership_unproven"] is True
+    assert not kb._identity_can_fence_handoff(4242, win_ident)
+    assert not kb._worker_scope_is_quiescent(win_ident, 4242)
     assert kb._dispatcher_owned_pgid(4242) is None
 
 
@@ -1097,6 +1111,7 @@ def test_injected_signal_fn_without_a_group_killer_keeps_per_pid_semantics(
     not hasattr(os, "killpg") or not hasattr(os, "setsid"),
     reason="POSIX process groups only",
 )
+@pytest.mark.live_system_guard_bypass
 def test_reclaim_reaps_the_workers_descendants(tmp_path):
     """E2E with real processes: a dispatcher-shaped worker (own session) that
     spawned a long-running child. Reclaiming must leave neither behind."""
@@ -1144,12 +1159,203 @@ def test_reclaim_reaps_the_workers_descendants(tmp_path):
         # spawned is left holding the workspace after the reclaim.
         worker.wait(timeout=10)
         assert _gone(child_pid), "descendant survived the reclaim"
-        assert info["terminated"] is True
+        scope_observable = kb._process_group_has_actionable_member(worker.pid)
+        if scope_observable is None:
+            assert info["terminated"] is False
+            assert info["ownership_reason"] == "worker_scope_not_quiescent"
+        else:
+            assert info["terminated"] is True, info
         assert info["process_group"] is True
     finally:
         for pid in (worker.pid,):
             try:
                 os.killpg(pid, 9)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            worker.wait(timeout=5)
+        except Exception:
+            pass
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "killpg") or not hasattr(os, "setsid"),
+    reason="POSIX process groups only",
+)
+@pytest.mark.live_system_guard_bypass
+def test_review_handoff_waits_for_the_real_worker_group(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Real process proof: a dead leader is insufficient while its child
+    remains in the dispatcher's persisted process group."""
+    import signal
+    import subprocess
+    import sys
+
+    childfile = tmp_path / "review-child.pid"
+    code = (
+        "import subprocess, sys, time, pathlib\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(childfile)!r}).write_text(str(p.pid))\n"
+        "time.sleep(300)\n"
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", code], start_new_session=True,
+    )
+    child_pid = None
+    try:
+        for _ in range(100):
+            if childfile.exists() and childfile.read_text().strip():
+                break
+            time.sleep(0.1)
+        child_pid = int(childfile.read_text().strip())
+        assert os.getpgid(worker.pid) == worker.pid
+        assert os.getpgid(child_pid) == worker.pid
+
+        monkeypatch.setattr(
+            kb, "capture_worker_identity", _REAL_CAPTURE_WORKER_IDENTITY,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="real review", assignee="builder")
+            run = kb.claim_task(conn, tid, claimer=f"{host}:worker")
+            assert run is not None
+            kb._set_worker_pid(conn, tid, worker.pid)
+            res = kb.request_review(
+                conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+                expected_run_id=run.current_run_id,
+            )
+            assert kb.claim_review_task(conn, tid) is None
+
+            worker.terminate()
+            worker.wait(timeout=10)
+            os.kill(child_pid, 0)
+            assert kb._release_quiesced_review_handoffs(conn) == []
+            assert kb.claim_review_task(conn, tid) is None
+            assert not kb.reclaim_task(
+                conn, tid, reason="operator checked before child exit",
+            )
+            retained = _row(conn, tid)
+            assert retained["claim_lock"] is not None
+            assert retained["status"] == "review"
+            assert _events(conn, tid, "reclaim_deferred")[-1]["reason"] == (
+                "ownership_unproven"
+            )
+
+            os.kill(child_pid, signal.SIGKILL)
+            for _ in range(100):
+                if not kb._stored_worker_group_alive(
+                    _row(conn, tid)["worker_identity"], worker.pid,
+                ):
+                    break
+                time.sleep(0.1)
+            assert not kb._stored_worker_group_alive(
+                _row(conn, tid)["worker_identity"], worker.pid,
+            )
+            assert kb.reclaim_task(
+                conn, tid, reason="operator checked after child exit",
+            )
+            assert _row(conn, tid)["status"] == "review"
+            assert kb.claim_review_task(conn, tid) is not None
+    finally:
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            worker.wait(timeout=5)
+        except Exception:
+            pass
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "killpg") or not hasattr(os, "setsid"),
+    reason="POSIX process groups only",
+)
+@pytest.mark.live_system_guard_bypass
+def test_running_reclaim_waits_for_the_real_worker_group(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """A dead leader never makes an ordinary running card spawnable while a
+    descendant can still act in the persisted dispatcher process group."""
+    import signal
+    import subprocess
+
+    childfile = tmp_path / "running-child.pid"
+    code = (
+        "import subprocess, sys, time, pathlib\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(childfile)!r}).write_text(str(p.pid))\n"
+        "time.sleep(300)\n"
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", code], start_new_session=True,
+    )
+    child_pid = None
+    try:
+        for _ in range(100):
+            if childfile.exists() and childfile.read_text().strip():
+                break
+            time.sleep(0.1)
+        child_pid = int(childfile.read_text().strip())
+        assert os.getpgid(worker.pid) == worker.pid
+        assert os.getpgid(child_pid) == worker.pid
+
+        monkeypatch.setattr(
+            kb, "capture_worker_identity", _REAL_CAPTURE_WORKER_IDENTITY,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="real running", assignee="builder")
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:worker")
+            assert claimed is not None
+            kb._set_worker_pid(conn, tid, worker.pid)
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 10_000, tid),
+            )
+            conn.commit()
+
+            worker.terminate()
+            worker.wait(timeout=10)
+            os.kill(child_pid, 0)
+            assert kb.detect_crashed_workers(conn) == []
+            assert not kb.reclaim_task(
+                conn, tid, reason="leader exited while child remained",
+            )
+            retained = _row(conn, tid)
+            assert retained["status"] == "running"
+            assert retained["claim_lock"] is not None
+            assert kb.claim_task(conn, tid) is None
+
+            os.kill(child_pid, signal.SIGKILL)
+            for _ in range(100):
+                try:
+                    os.kill(child_pid, 0)
+                except (ProcessLookupError, PermissionError):
+                    break
+                time.sleep(0.1)
+            if kb._process_group_has_actionable_member(worker.pid) is None:
+                monkeypatch.setattr(
+                    kb, "_process_group_has_actionable_member",
+                    lambda _pgid: False,
+                )
+            assert kb.detect_crashed_workers(conn) == [tid]
+            assert _row(conn, tid)["status"] == "ready"
+            assert kb.claim_task(conn, tid) is not None
+    finally:
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         try:
@@ -1206,6 +1412,44 @@ def test_capture_worker_identity_reads_this_process(kanban_home, monkeypatch):
     assert ident["scheme"] in {"linux_proc", "create_time"}
     # Stable across reads — that is the entire property being relied on.
     assert kb.capture_worker_identity(os.getpid()) == ident
+
+
+def test_non_linux_capture_preserves_sub_millisecond_birth_precision(monkeypatch):
+    native_birth = 1_700_000_000.0004
+
+    class _Process:
+        def __init__(self, pid):
+            assert pid == 4242
+
+        def create_time(self):
+            return native_birth
+
+    monkeypatch.setattr(kb.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "psutil", type("P", (), {"Process": _Process}))
+    monkeypatch.delattr(kb.os, "getpgid", raising=False)
+    monkeypatch.delattr(kb.os, "getsid", raising=False)
+
+    identity = kb.capture_worker_identity(4242)
+    assert identity is not None
+    assert identity["create_time"] == native_birth
+
+
+def test_linux_host_scope_changes_with_the_pid_namespace(monkeypatch):
+    inode = {"value": 111}
+
+    class _Stat:
+        @property
+        def st_ino(self):
+            return inode["value"]
+
+    monkeypatch.setattr(kb.sys, "platform", "linux")
+    monkeypatch.setattr(kb, "_read_linux_boot_id", lambda: "boot-under-test")
+    monkeypatch.setattr(kb.os, "stat", lambda _path: _Stat())
+
+    first = kb._read_host_scope_id()
+    assert first == kb._read_host_scope_id()
+    inode["value"] = 222
+    assert kb._read_host_scope_id() != first
 
 
 def test_capture_worker_identity_is_none_for_a_dead_pid(kanban_home, monkeypatch):
@@ -1464,14 +1708,15 @@ def test_verify_authorises_the_group_only_for_a_session_leader():
     ) == ("none", "not_dispatcher_session")
 
 
-def test_verify_accepts_create_time_within_epsilon_and_rejects_beyond_it():
+def test_verify_requires_the_exact_canonical_create_time():
     base = {"v": 1, "scheme": "create_time", "pid": 4242, "create_time": 1000.0}
-    near = dict(base, create_time=1000.0 + kb._CREATE_TIME_EPSILON / 2)
-    far = dict(base, create_time=1000.0 + kb._CREATE_TIME_EPSILON + 1)
+    same = dict(base)
+    reborn_within_one_millisecond = dict(base, create_time=1000.0004)
     assert kb.verify_worker_ownership(
-        4242, json.dumps(base), probe_fn=lambda _p: near) == ("pid", "ok")
+        4242, json.dumps(base), probe_fn=lambda _p: same) == ("pid", "ok")
     assert kb.verify_worker_ownership(
-        4242, json.dumps(base), probe_fn=lambda _p: far) == (
+        4242, json.dumps(base),
+        probe_fn=lambda _p: reborn_within_one_millisecond) == (
         "none", "identity_mismatch")
 
 
@@ -1536,7 +1781,7 @@ def test_no_progress_refuses_to_signal_a_legacy_row_and_holds_the_claim(
         deferred = _events(conn, tid, "reclaim_deferred")
         assert len(deferred) == 1
         assert deferred[0]["reason"] == "ownership_unproven"
-        assert deferred[0]["ownership_reason"] == "identity_absent"
+        assert deferred[0]["ownership_reason"] == "host_scope_unproven"
         assert deferred[0]["trigger"] == "no_progress_worker_alive"
         assert deferred[0]["signalled"] is False
         assert _events(conn, tid, "no_progress") == []
@@ -1731,28 +1976,86 @@ def test_timed_out_receipt_records_the_ownership_verdict(kanban_home, monkeypatc
         assert payload["signalled"] is True
 
 
-def test_remote_claims_are_never_signalled(kanban_home, monkeypatch):
+def test_remote_or_hostname_drifted_claims_are_never_released_or_signalled(
+    kanban_home, monkeypatch,
+):
     """A pid recorded by another host names a process on THAT host. Signalling
     it here means signalling whatever happens to hold the number locally."""
     sent, signal_fn = _mock_worker(monkeypatch)
     with kb.connect() as conn:
         tid = _running_task(conn)
         conn.execute(
-            "UPDATE tasks SET claim_lock = ? WHERE id = ?",
-            ("some-other-host:worker", tid),
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(_fake_identity(4242, host_scope_id="remote-scope")), tid),
         )
         _wedge(conn, tid)
 
         assert kb.detect_no_progress_running(
             conn, no_progress_timeout_seconds=2700, signal_fn=signal_fn,
-        ) == [tid]
+        ) == []
         assert sent == []
-        payload = _events(conn, tid, "no_progress")[0]
-        assert payload["worker_state"] == "remote"
-        assert payload["ownership_reason"] == "remote_claim"
-        # Remote is not an ownership failure — we simply cannot manage it —
-        # so the claim is released rather than held forever.
-        assert _events(conn, tid, "reclaim_deferred") == []
+        assert kb.get_task(conn, tid).status == "running"
+        deferred = _events(conn, tid, "reclaim_deferred")[-1]
+        assert deferred["reason"] == "ownership_unproven"
+        assert deferred["ownership_reason"] == "host_scope_unproven"
+        assert deferred["signalled"] is False
+        assert _events(conn, tid, "no_progress") == []
+
+        manual_tid = _running_task(conn, title="manual-hostname-drift")
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_identity = ? WHERE id = ?",
+            (
+                "previous-hostname:worker",
+                json.dumps(_fake_identity(4242, host_scope_id="remote-scope")),
+                manual_tid,
+            ),
+        )
+        conn.commit()
+        assert not kb.reclaim_task(
+            conn, manual_tid, reason="hostname changed",
+            signal_fn=signal_fn,
+        )
+        assert kb.get_task(conn, manual_tid).status == "running"
+        manual_deferred = _events(conn, manual_tid, "reclaim_deferred")[-1]
+        assert manual_deferred["reason"] == "ownership_unproven"
+        assert manual_deferred["ownership_reason"] == "host_scope_unproven"
+
+
+def test_same_hostname_legacy_identity_never_releases_running_authority(
+    kanban_home, monkeypatch,
+):
+    """Hostname equality cannot upgrade a pre-host-scope row into ownership."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda _identity, _pid=None: False,
+    )
+    with kb.connect() as conn:
+        legacy = _fake_identity(4242)
+        legacy.pop("host_scope_id")
+
+        manual_tid = _running_task(conn, title="legacy manual")
+        conn.execute(
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(legacy), manual_tid),
+        )
+        conn.commit()
+        assert not kb.reclaim_task(conn, manual_tid, reason="legacy row")
+        assert _row(conn, manual_tid)["claim_lock"] is not None
+
+        automatic_tid = _running_task(conn, title="legacy automatic")
+        conn.execute(
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(legacy), automatic_tid),
+        )
+        _wedge(conn, automatic_tid)
+        assert kb.detect_no_progress_running(
+            conn, no_progress_timeout_seconds=2700,
+            signal_fn=lambda *_args: None,
+        ) == []
+        assert _row(conn, automatic_tid)["claim_lock"] is not None
+        assert _events(conn, automatic_tid, "reclaim_deferred")[-1][
+            "ownership_reason"
+        ] == "host_scope_unproven"
 
 
 def test_reclaiming_clears_the_identity_with_the_pid(kanban_home, monkeypatch):
@@ -1769,11 +2072,10 @@ def test_reclaiming_clears_the_identity_with_the_pid(kanban_home, monkeypatch):
         assert row["worker_identity"] is None
 
 
-def test_operator_reclaim_releases_but_reports_that_it_could_not_kill(
+def test_operator_reclaim_defers_when_it_cannot_prove_worker_ownership(
     kanban_home, monkeypatch,
 ):
-    """Operator-driven reclaim keeps its escape hatch — the card unsticks —
-    but it still never signals an unprovable pid, and the receipt says so."""
+    """Operator intent cannot make a possibly-live old worker harmless."""
     sent, signal_fn = _mock_worker(monkeypatch)
     with kb.connect() as conn:
         tid = _running_task(conn)
@@ -1781,12 +2083,523 @@ def test_operator_reclaim_releases_but_reports_that_it_could_not_kill(
             "UPDATE tasks SET worker_identity = NULL WHERE id = ?", (tid,))
         conn.commit()
 
-        assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=signal_fn)
+        assert not kb.reclaim_task(
+            conn, tid, reason="operator", signal_fn=signal_fn,
+        )
         assert sent == []
-        assert kb.get_task(conn, tid).status != "running"
-        payload = _events(conn, tid, "reclaimed")[-1]
-        assert payload["ownership"] == "unproven"
-        assert payload["ownership_reason"] == "identity_absent"
+        assert kb.get_task(conn, tid).status == "running"
+        assert _events(conn, tid, "reclaimed") == []
+        payload = _events(conn, tid, "reclaim_deferred")[-1]
+        assert payload["reason"] == "ownership_unproven"
+        assert payload["ownership_reason"] == "host_scope_unproven"
+        assert payload["trigger"] == "manual_reclaim_worker_scope_alive"
+
+
+def test_review_handoff_holds_authority_until_the_worker_scope_is_quiescent(
+    kanban_home, monkeypatch,
+):
+    """A worker may request review without making the reviewer spawnable
+    beside its still-live process scope."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda *_args: True,
+    )
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        ok, reason = kb.request_review(
+            conn, tid, summary="operator override", force=True,
+            with_reason=True,
+        )
+        assert not ok
+        assert "authority" in reason
+
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        row = _row(conn, tid)
+        assert row["status"] == "review"
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] == 4242
+        assert kb.count_running_tasks(conn) == 1
+        assert kb._release_quiesced_review_handoffs(conn) == []
+        assert _row(conn, tid)["claim_lock"] is not None
+
+
+def test_request_review_refuses_incomplete_or_retained_authority(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="incomplete", assignee="builder")
+        run = kb.claim_task(conn, tid)
+        assert run is not None
+
+        for kwargs in (
+            {"expected_run_id": run.current_run_id},
+            {"force": True},
+        ):
+            assert not kb.request_review(conn, tid, summary="unsafe", **kwargs)
+            row = _row(conn, tid)
+            assert row["status"] == "running"
+            assert row["claim_lock"] is not None
+
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        assert not kb.request_review(conn, tid, summary="unsafe", force=True)
+        assert _row(conn, tid)["claim_lock"] is not None
+
+
+def test_request_review_rejects_an_unreleasable_identity_before_mutation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        run_before = _run_row(conn, tid)
+
+        original_lock = _row(conn, tid)["claim_lock"]
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        ok, reason = kb.request_review(
+            conn, tid, summary="unsafe", reviewer="reviewer",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert not ok
+        assert "incomplete" in reason
+        assert _row(conn, tid)["status"] == "running"
+        assert _row(conn, tid)["worker_pid"] == 4242
+        assert _events(conn, tid, "review_requested") == []
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ? WHERE id = ?", (original_lock, tid),
+        )
+        conn.commit()
+
+        missing_host = _fake_identity(4242)
+        missing_host.pop("host_scope_id")
+        conn.execute(
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(missing_host), tid),
+        )
+        conn.commit()
+        ok, reason = kb.request_review(
+            conn, tid, summary="unsafe", reviewer="reviewer",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert not ok
+        assert "releasable" in reason
+        assert _row(conn, tid)["status"] == "running"
+        assert _row(conn, tid)["current_run_id"] == run_id
+        assert _events(conn, tid, "review_requested") == []
+        assert _run_row(conn, tid)["ended_at"] == run_before["ended_at"]
+
+        missing_group = _fake_identity(4242)
+        missing_group.pop("sid")
+        conn.execute(
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(missing_group), tid),
+        )
+        conn.commit()
+        ok, _reason = kb.request_review(
+            conn, tid, summary="still unsafe", reviewer="reviewer",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert not ok
+        assert _row(conn, tid)["status"] == "running"
+        assert _events(conn, tid, "review_requested") == []
+
+
+def test_request_changes_rejects_an_unreleasable_reviewer_before_mutation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unsafe reviewer", assignee="builder")
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        kb._set_worker_pid(conn, tid, 4242)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_identity = NULL WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        kb._set_worker_pid(conn, tid, 5252)
+        reviewer_lock = _row(conn, tid)["claim_lock"]
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL WHERE id = ?", (tid,),
+        )
+        conn.commit()
+
+        ok, reason = kb.request_changes(
+            conn, tid, reason="fix it", expected_run_id=review.current_run_id,
+        )
+        assert not ok
+        assert "incomplete" in reason
+        row = _row(conn, tid)
+        assert row["status"] == "running"
+        assert row["worker_pid"] == 5252
+        assert _events(conn, tid, "changes_requested") == []
+
+        missing_group = _fake_identity(5252)
+        missing_group.pop("pgid")
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_identity = ? WHERE id = ?",
+            (reviewer_lock, json.dumps(missing_group), tid),
+        )
+        conn.commit()
+
+        ok, reason = kb.request_changes(
+            conn, tid, reason="fix it", expected_run_id=review.current_run_id,
+        )
+        assert not ok
+        assert "releasable" in reason
+        row = _row(conn, tid)
+        assert row["status"] == "running"
+        assert row["current_run_id"] == review.current_run_id
+        assert _events(conn, tid, "changes_requested") == []
+
+
+def test_remote_review_handoff_is_never_released_by_local_pid_probes(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda _ident, _pid=None: False,
+    )
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_identity = ? WHERE id = ?",
+            (json.dumps(_fake_identity(4242, host_scope_id="remote-scope")), tid),
+        )
+        conn.commit()
+
+        assert kb._release_quiesced_review_handoffs(conn) == []
+        row = _row(conn, tid)
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] == 4242
+        assert kb.claim_review_task(conn, tid) is None
+        assert _events(conn, tid, "review_handoff_quiesced") == []
+
+
+def test_review_handoff_releases_only_after_leader_and_group_are_gone(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    group_alive = {"value": True}
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive",
+        lambda _identity, _pid=None: group_alive["value"],
+    )
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        monkeypatch.setattr(kb, "capture_worker_identity", lambda _pid: None)
+
+        assert kb._release_quiesced_review_handoffs(conn) == []
+        assert _row(conn, tid)["claim_lock"] is not None
+
+        group_alive["value"] = False
+        assert kb._release_quiesced_review_handoffs(conn) == [tid]
+        row = _row(conn, tid)
+        assert row["status"] == "review"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        assert row["worker_identity"] is None
+        assert kb.count_running_tasks(conn) == 0
+        assert len(_events(conn, tid, "review_handoff_quiesced")) == 1
+
+
+def test_request_changes_keeps_reviewer_authority_until_quiescent(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    group_alive = {"value": True}
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive",
+        lambda _identity, _pid=None: group_alive["value"],
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="builder")
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        kb._set_worker_pid(conn, tid, 4241)
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=implementation.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_identity = NULL WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        kb._set_worker_pid(conn, tid, 5252)
+
+        assert kb.request_changes(
+            conn, tid, reason="fix it", expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        row = _row(conn, tid)
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] == 5252
+        assert kb.claim_task(conn, tid) is None
+        assert kb.count_running_tasks(conn) == 1
+
+        monkeypatch.setattr(kb, "capture_worker_identity", lambda _pid: None)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        group_alive["value"] = False
+        assert kb._release_quiesced_review_handoffs(conn) == [tid]
+        assert kb.claim_task(conn, tid) is not None
+
+
+def test_retained_implementation_counts_against_implementer_profile(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    with kb.connect() as conn:
+        handoff = _running_task(conn, title="handoff", assignee="builder")
+        run_id = kb.get_task(conn, handoff).current_run_id
+        res = kb.request_review(
+            conn, handoff, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        next_builder = kb.create_task(
+            conn, title="next builder task", assignee="builder",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_spawn=10,
+            max_in_progress=10,
+            max_in_progress_per_profile=1,
+            reconcile_orphans=False,
+        )
+
+        assert next_builder not in [task[0] for task in result.spawned]
+        assert (next_builder, "builder", 1) in result.skipped_per_profile_capped
+
+
+def test_retained_review_counts_against_reviewer_profile(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    with kb.connect() as conn:
+        handoff = kb.create_task(conn, title="review rework", assignee="builder")
+        implementation = kb.claim_task(conn, handoff)
+        assert implementation is not None
+        kb._set_worker_pid(conn, handoff, 4241)
+        res = kb.request_review(
+            conn, handoff, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=implementation.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_identity = NULL WHERE id = ?", (handoff,),
+        )
+        conn.commit()
+        review = kb.claim_review_task(conn, handoff)
+        assert review is not None
+        kb._set_worker_pid(conn, handoff, 5252)
+        assert kb.request_changes(
+            conn, handoff, reason="fix it",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+
+        next_reviewer = kb.create_task(
+            conn, title="next reviewer task", assignee="reviewer",
+        )
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_spawn=10,
+            max_in_progress=10,
+            max_in_progress_per_profile=1,
+            reconcile_orphans=False,
+        )
+
+        assert next_reviewer not in [task[0] for task in result.spawned]
+        assert (next_reviewer, "reviewer", 1) in result.skipped_per_profile_capped
+
+
+def test_reopen_review_refuses_a_fenced_implementer(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+
+        assert not kb.reopen_review_task(conn, tid)
+        row = _row(conn, tid)
+        assert row["status"] == "review"
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] == 4242
+
+
+def test_manual_reclaim_of_quiescent_review_preserves_pending_review(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+
+        assert kb.reclaim_task(
+            conn, tid, reason="release dead handoff",
+            signal_fn=lambda *_args: None,
+        )
+        row = _row(conn, tid)
+        assert row["status"] == "review"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        assert _events(conn, tid, "reclaimed")[-1]["retry_status"] == "review"
+        assert kb.claim_review_task(conn, tid) is not None
+
+
+def test_review_handoff_missing_identity_never_guesses_group_quiescence(
+    kanban_home, monkeypatch,
+):
+    """A pid number alone does not prove the prior worker led that group."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        monkeypatch.setattr(kb, "capture_worker_identity", lambda _pid: None)
+        conn.execute(
+            "UPDATE tasks SET worker_identity = NULL WHERE id = ?", (tid,),
+        )
+        conn.commit()
+
+        assert kb._release_quiesced_review_handoffs(conn) == []
+        assert _row(conn, tid)["claim_lock"] is not None
+        assert kb.claim_review_task(conn, tid) is None
+        assert not kb.reclaim_task(conn, tid, reason="legacy row")
+
+
+def test_unknown_or_inconsistent_group_proof_holds_the_fence(monkeypatch):
+    identity = _fake_identity(4242)
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    assert kb._stored_worker_group_alive(identity, 4242) is True
+
+    monkeypatch.setattr(os, "killpg", lambda *_args: None, raising=False)
+    sidless = {
+        "v": kb.WORKER_IDENTITY_VERSION,
+        "scheme": "create_time",
+        "pid": 4242,
+        "create_time": 1000.0,
+    }
+    assert kb._stored_worker_group_alive(sidless, 4242) is True
+    assert kb._stored_worker_group_alive(identity, 4343) is True
+
+    def _missing(*_args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", _missing, raising=False)
+    assert kb._stored_worker_group_alive(None, 4242) is True
+    assert kb._stored_worker_group_alive(sidless, 4242) is True
+
+
+def test_process_group_enumeration_ignores_zombies_but_not_live_members(
+    monkeypatch,
+):
+    class _Result:
+        returncode = 0
+        stdout = "10 4242 Z\n11 4242 S\n12 9999 R\n"
+
+    monkeypatch.setattr(kb.subprocess, "run", lambda *_args, **_kwargs: _Result())
+    assert kb._process_group_has_actionable_member(4242) is True
+
+    _Result.stdout = "10 4242 Z\n12 9999 R\n"
+    assert kb._process_group_has_actionable_member(4242) is False
+
+    _Result.returncode = 1
+    assert kb._process_group_has_actionable_member(4242) is None
+
+
+def test_scheme_change_with_a_live_pid_does_not_release_review(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "verify_worker_ownership",
+        lambda *_args, **_kwargs: ("none", "identity_scheme_changed"),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda _ident, _pid=None: False,
+    )
+    with kb.connect() as conn:
+        tid = _running_task(conn, assignee="builder")
+        run_id = kb.get_task(conn, tid).current_run_id
+        res = kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer", with_reason=True,
+            expected_run_id=run_id,
+        )
+        assert kb._release_quiesced_review_handoffs(conn) == []
+        assert _row(conn, tid)["claim_lock"] is not None
+
+
+def test_dispatch_tick_checks_review_handoffs_before_spawning(
+    kanban_home, monkeypatch,
+):
+    """The handoff fence is not merely a helper: every real dispatcher tick
+    must run it before any lane can spawn a replacement process."""
+    order: list[str] = []
+    monkeypatch.setattr(kb, "reap_worker_zombies", lambda: order.append("reap"))
+    monkeypatch.setattr(
+        kb, "_release_quiesced_review_handoffs",
+        lambda _conn: order.append("handoff") or [],
+    )
+
+    with kb.connect() as conn:
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: order.append("spawn"),
+            max_spawn=0,
+        )
+
+    assert order[:2] == ["reap", "handoff"]
+    assert "spawn" not in order
 
 
 # ---------------------------------------------------------------------------
@@ -2616,20 +3429,59 @@ def test_a_legacy_row_with_a_live_pid_is_not_called_crashed(
         assert kb.get_task(conn, tid).status == "running"
 
 
-def test_reconcile_does_not_defer_forever_on_a_recycled_pid(
+def test_reconcile_requires_the_recorded_group_to_be_quiescent(
     kanban_home, monkeypatch,
 ):
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_stored_worker_group_alive", lambda *_args: True,
+    )
     with kb.connect() as conn:
         tid = _running_task(conn)
         conn.execute(
-            "UPDATE tasks SET claim_expires = NULL WHERE id = ?", (tid,))
+            "UPDATE tasks SET claim_lock = NULL WHERE id = ?", (tid,))
         conn.commit()
         # Matching identity: a real live worker, so the orphan is held.
         assert kb.reconcile_orphaned_running(conn) == []
+        assert _row(conn, tid)["status"] == "running"
 
+        # A recycled/dead leader is not proof that its descendants are gone.
         monkeypatch.setattr(
             kb, "capture_worker_identity",
             lambda pid: _fake_identity(pid, starttime=999_999),
         )
+        assert kb.reconcile_orphaned_running(conn) == []
+        assert _row(conn, tid)["status"] == "running"
+        assert _events(conn, tid, "reclaim_deferred")[-1]["trigger"] == (
+            "orphaned_running_scope_not_quiescent"
+        )
+
+        monkeypatch.setattr(
+            kb, "_stored_worker_group_alive", lambda *_args: False,
+        )
         assert kb.reconcile_orphaned_running(conn) == [tid]
+        assert _row(conn, tid)["status"] == "ready"
+
+
+def test_reconcile_holds_an_orphan_from_another_host_scope(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        tid = _running_task(conn)
+        identity = _fake_identity(4242, host_scope_id="another-container")
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, worker_identity = ? "
+            "WHERE id = ?",
+            (json.dumps(identity), tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb, "_stored_worker_group_alive", lambda *_args: False,
+        )
+        assert kb.reconcile_orphaned_running(conn) == []
+        assert _row(conn, tid)["status"] == "running"
+        deferred = _events(conn, tid, "reclaim_deferred")[-1]
+        assert deferred["reason"] == "ownership_unproven"
+        assert deferred["ownership_reason"] == "worker_scope_not_quiescent"
