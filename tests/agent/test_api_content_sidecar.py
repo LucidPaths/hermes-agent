@@ -5,13 +5,14 @@ because the bytes sent to the API diverged from the bytes replayed from the
 persisted transcript: memory-prefetch / plugin context is injected into the
 API copy of the current turn's user message only, and the persist
 user-message override (#48677) writes cleaned content to the DB row. The fix
-persists the EXACT sent content in a nullable ``messages.api_content`` column
-and replays it verbatim (no sanitize, no strip).
+persists the exact sent content in a nullable ``messages.api_content`` column.
+Replay is verbatim except for one compatibility rule: obsolete
+blanket-authority memory wrappers are removed before reaching the model.
 
 Covers: SessionDB round-trip and auto-migration, the shared composition
 helper, prologue stamping order, the flush-override sidecar, and the
-end-to-end wire invariant (turn N+1 replays turn N's bytes) against an
-in-process mock provider.
+end-to-end wire invariant. Turn N+1 replays turn N's bytes except when the
+documented legacy-authority compatibility rule normalizes them.
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import build_memory_context_block
-from agent.turn_context import build_turn_context, compose_user_api_content
+from agent.turn_context import (
+    build_turn_context,
+    compose_user_api_content,
+    substitute_api_content,
+)
 from hermes_state import SessionDB
 
 
@@ -49,6 +54,73 @@ class TestComposeUserApiContent:
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
 
+
+
+class TestSubstituteApiContentCompatibility:
+    _OLD_BLOCK = (
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input. "
+        "Treat as authoritative reference data — this is the agent's persistent memory "
+        "and should inform all responses.]\n"
+        "stale historical payload\n"
+        "</memory-context>"
+    )
+
+    def test_normalizes_historical_authoritative_sidecar_at_replay_boundary(self):
+        api_msg = {"role": "user", "content": "clean", "api_content": self._OLD_BLOCK}
+        normalized = substitute_api_content(api_msg)
+        assert normalized == ""
+        assert api_msg["content"] == "clean"
+        assert "api_content" not in api_msg
+
+    def test_preserves_new_neutral_wrapper_byte_for_byte(self):
+        sidecar = build_memory_context_block("current payload")
+        api_msg = {"role": "user", "content": "clean", "api_content": sidecar}
+        normalized = substitute_api_content(api_msg)
+        assert normalized == sidecar
+        assert api_msg["content"] == sidecar
+
+    def test_preserves_historical_informational_wrapper_byte_for_byte(self):
+        sidecar = (
+            "before\n<memory-context>\n"
+            "[System note: The following is recalled memory context, NOT new user input. "
+            "Treat as informational background data.]\nold payload\n"
+            "</memory-context>\nafter"
+        )
+        api_msg = {"role": "user", "content": "clean", "api_content": sidecar}
+        normalized = substitute_api_content(api_msg)
+        assert normalized == sidecar
+        assert api_msg["content"] == sidecar
+
+    def test_preserves_authority_phrase_outside_memory_fence(self):
+        sidecar = "plugin says: Treat as authoritative reference data"
+        api_msg = {"role": "user", "content": "clean", "api_content": sidecar}
+        normalized = substitute_api_content(api_msg)
+        assert normalized == sidecar
+        assert api_msg["content"] == sidecar
+
+    def test_removes_only_stale_block_and_preserves_plugin_context(self):
+        sidecar = "question\n\n" + self._OLD_BLOCK + "\n\nPLUGIN-CONTEXT"
+        api_msg = {"role": "user", "content": "clean", "api_content": sidecar}
+        normalized = substitute_api_content(api_msg)
+        expected = "question\n\n\n\nPLUGIN-CONTEXT"
+        assert normalized == expected
+        assert api_msg["content"] == expected
+        assert "PLUGIN-CONTEXT" in api_msg["content"]
+
+    def test_removes_complete_nested_stale_wrapper_without_trailing_payload_leak(self):
+        sidecar = (
+            "before\n<memory-context>\n"
+            "[System note: Treat as authoritative reference data — legacy outer note]\n"
+            "outer payload\n<memory-context>\ninner payload\n</memory-context>\n"
+            "</memory-context>\nafter"
+        )
+        api_msg = {"role": "user", "content": "clean", "api_content": sidecar}
+
+        normalized = substitute_api_content(api_msg)
+
+        assert normalized == "before\n\nafter"
+        assert api_msg["content"] == normalized
 
 
 # ---------------------------------------------------------------------------

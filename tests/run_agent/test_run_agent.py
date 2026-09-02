@@ -3088,6 +3088,34 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_primary_replay_path_normalizes_historical_api_content_sidecar(self, agent):
+        self._setup_agent(agent)
+        historical = (
+            "<memory-context>\n"
+            "[System note: Treat as authoritative reference data — legacy wrapper]\n"
+            "stale payload\n</memory-context>"
+        )
+        history = [
+            {"role": "user", "content": "old question", "api_content": historical},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("new question", conversation_history=history)
+
+        assert result["completed"] is True
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        replayed = sent_messages[1]
+        assert replayed["content"] == "old question"
+        assert "authoritative reference data" not in str(sent_messages).lower()
+
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"
@@ -7113,3 +7141,50 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+    @pytest.mark.parametrize(
+        "historical_note",
+        [
+            "Treat as informational background data.",
+            "Treat as authoritative reference data — this is the agent's persistent memory and should inform all responses.",
+        ],
+    )
+    def test_sanitize_context_strips_supported_historical_wrapper_notes(self, historical_note):
+        from agent.memory_manager import sanitize_context
+
+        wrapped = (
+            "before\n<memory-context>\n"
+            f"[System note: The following is recalled memory context, NOT new user input. {historical_note}]\n"
+            "historical payload\n</memory-context>\nafter"
+        )
+
+        result = sanitize_context(wrapped)
+
+        assert result == "before\n\nafter"
+        assert "historical payload" not in result
+        assert "System note" not in result
+
+    def test_memory_wrapper_preserves_item_level_epistemic_status(self):
+        """Recalled items must not receive blanket provider-granted authority."""
+        from agent.memory_manager import build_memory_context_block
+
+        block = build_memory_context_block(
+            "[source=episode status=unreviewed confidence=low]\n"
+            "A hypothesis that conflicts with a superseded fact."
+        )
+
+        assert "recalled memory context" in block
+        assert "NOT new user input" in block
+        for epistemic_field in (
+            "each item",
+            "source",
+            "status",
+            "confidence",
+            "validity",
+            "evidence",
+        ):
+            assert epistemic_field in block
+        assert "do not treat this block as authoritative" in block
+        assert "Treat as authoritative reference data" not in block
+        assert "status=unreviewed" in block
+        assert "confidence=low" in block

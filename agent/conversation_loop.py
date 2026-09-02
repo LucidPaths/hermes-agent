@@ -50,6 +50,7 @@ from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
+    substitute_api_content,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
@@ -2489,12 +2490,12 @@ def run_conversation(
             # _clone_message_for_send.
             api_msg = _clone_message_for_send(msg)
 
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
+            # api_content is the persistence sidecar carrying the bytes sent
+            # when they differ from clean stored content. Substitution also
+            # removes the obsolete blanket-authority memory wrapper from old
+            # sidecars (see turn_context). It is bookkeeping, never a provider
+            # field — pop it from EVERY outgoing copy.
+            _api_content = substitute_api_content(api_msg)
 
             # Display-only timeline metadata. Never a provider field — strip
             # from every outgoing copy so strict OpenAI-compatible backends
@@ -2537,11 +2538,12 @@ def run_conversation(
                 and _api_content
                 and msg.get("role") in ("user", "assistant")
             ):
-                # Historical message: replay the exact bytes sent when it was
-                # live, so the provider prompt-cache prefix stays byte-stable
-                # instead of diverging at the injection point and
-                # re-prefilling everything after it. User rows carry the
-                # prefetch/plugin injection sidecar; user AND assistant rows
+                # Historical message: replay the previously sent bytes, except
+                # for the one-time removal of an obsolete blanket-authority
+                # memory wrapper. That intentional upgrade boundary aside, the
+                # provider prompt-cache prefix stays byte-stable. User rows
+                # carry the prefetch/plugin injection sidecar; user AND
+                # assistant rows
                 # can carry a sanitize-divergence sidecar (content that
                 # ``get_messages_as_conversation``'s sanitize_context/strip
                 # would rewrite on reload — see the capture in
