@@ -80,4 +80,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Fork jobs use the standard 4-core runner. Two concurrent checks keep
+        # nested Vitest/build worker pools from oversubscribing that host; the
+        # NousResearch 32-core runner retains the original full fan-out.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency ${{ github.repository_owner == 'NousResearch' && '32' || '2' }}

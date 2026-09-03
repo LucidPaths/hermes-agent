@@ -3,6 +3,7 @@
 from collections import Counter
 from pathlib import Path
 import re
+import subprocess
 
 import yaml
 
@@ -21,6 +22,10 @@ OWNER_CONDITIONED_VALUE = re.compile(
     r"&&\s*(?P<upstream>'[^']+'|-?\d+)\s*\|\|\s*"
     r"(?P<fork>'[^']+'|-?\d+)\s*\}\}$"
 )
+OWNER_CONDITIONED_STRING_VALUE = re.compile(
+    r"^\$\{\{\s*(?P<condition>github\.repository_owner\s*==\s*'[^']+')\s*"
+    r"&&\s*(?P<upstream>'[^']+')\s*\|\|\s*(?P<fork>'[^']+')\s*\}\}$"
+)
 JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 RUNNER_ASSIGNMENT = re.compile(r"^\s+(?:-\s+)?(runs-on|runner):\s*(.*?)\s*$")
 
@@ -37,6 +42,10 @@ EXPECTED_TEST_LANE = {
     "runs-on": ("ubuntu-latest-96-core", "ubuntu-latest"),
     "timeout-minutes": (30, 60),
     "workers": (96, 4),
+}
+EXPECTED_JS_LANE = {
+    "runner": ("ubuntu-latest-32-core", "ubuntu-latest"),
+    "concurrency": ("32", "2"),
 }
 
 
@@ -223,3 +232,94 @@ def test_python_test_lane_rejects_comment_bypass_and_decoupled_active_values():
     assert any("different owner conditions" in violation for violation in violations)
     assert any("runs-on expected" in violation for violation in violations)
     assert any("workers expected" in violation for violation in violations)
+
+
+def _parse_owner_conditioned_string(value: object) -> tuple[str, str, str] | None:
+    if not isinstance(value, str):
+        return None
+    match = OWNER_CONDITIONED_STRING_VALUE.fullmatch(value.strip())
+    if not match:
+        return None
+    return (
+        re.sub(r"\s+", "", match.group("condition")),
+        match.group("upstream")[1:-1],
+        match.group("fork")[1:-1],
+    )
+
+
+def _js_test_lane_policy_violations(workflow: str) -> list[str]:
+    """Validate active YAML runner and concurrency branches as one policy."""
+    document = yaml.safe_load(workflow) or {}
+    job = document.get("jobs", {}).get("check", {})
+    step = next(
+        (
+            step
+            for step in job.get("steps", [])
+            if isinstance(step, dict) and step.get("name") == "Run all workspace checks"
+        ),
+        None,
+    )
+    run = (step or {}).get("run")
+    concurrency_expression = None
+    if isinstance(run, str):
+        match = re.search(r"(\$\{\{[^}]+\}\})", run)
+        concurrency_expression = match.group(1) if match else None
+    values = {"runner": job.get("runs-on"), "concurrency": concurrency_expression}
+    parsed = {field: _parse_owner_conditioned_string(value) for field, value in values.items()}
+    violations = [
+        f"js.test.{field} is not an owner-conditioned expression"
+        for field, expression in parsed.items()
+        if expression is None
+    ]
+    if violations:
+        return violations
+    runner = parsed["runner"]
+    concurrency = parsed["concurrency"]
+    assert runner is not None and concurrency is not None
+    expressions = {"runner": runner, "concurrency": concurrency}
+    conditions = {expression[0] for expression in expressions.values()}
+    if len(conditions) != 1:
+        violations.append("js test runner and concurrency use different owner conditions")
+    if conditions != {"github.repository_owner=='NousResearch'"}:
+        violations.append("js test lane is not conditioned on the NousResearch owner")
+    for field, expected in EXPECTED_JS_LANE.items():
+        actual = expressions[field][1:]
+        if actual != expected:
+            violations.append(f"js.test.{field} expected {expected}, got {actual}")
+    return violations
+
+
+def test_js_test_lane_validates_active_yaml_runner_and_concurrency_coupling():
+    assert not _js_test_lane_policy_violations(_workflow("js-tests.yml"))
+
+
+def test_js_test_lane_rejects_comment_bypass_and_decoupled_active_values():
+    workflow = """
+    jobs:
+      check:
+        # runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+        runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+        steps:
+          - name: Run all workspace checks
+            # run: node runner.mjs --concurrency ${{ github.repository_owner == 'NousResearch' && '32' || '2' }}
+            run: node runner.mjs --concurrency ${{ github.repository_owner == 'OtherOwner' && '32' || '2' }}
+    """
+    violations = _js_test_lane_policy_violations(workflow)
+    assert any("different owner conditions" in violation for violation in violations)
+
+
+def test_workspace_runner_rejects_malformed_concurrency_values():
+    script = ROOT / ".github" / "scripts" / "run-workspace-checks.mjs"
+    invalid_arguments = [
+        ["--concurrency"], ["--concurrency", ""], ["--concurrency", "0"],
+        ["--concurrency", "-1"], ["--concurrency", "1.5"],
+        ["--concurrency", "1e2"], ["--concurrency", "not-a-number"],
+        ["--concurrency", "Infinity"], ["--concurrency", "9007199254740992"],
+    ]
+    for arguments in invalid_arguments:
+        result = subprocess.run(
+            ["node", str(script), *arguments], cwd=ROOT, capture_output=True, text=True
+        )
+        assert result.returncode != 0, arguments
+        assert "--concurrency" in result.stderr, (arguments, result.stderr)
+        assert "positive integer" in result.stderr, (arguments, result.stderr)
