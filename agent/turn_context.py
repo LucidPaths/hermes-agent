@@ -18,8 +18,9 @@ The builder still mutates ``agent`` heavily (counters, thread id, cached prompt,
 session DB) exactly as the inline code did — those side effects are the point. The
 ``TurnContext`` it returns carries only the *locals* the loop reads back.
 
-Behavior is identical to the original inline prologue; this is a pure
-move-and-name refactor with no semantic change.
+The builder preserves the original inline prologue behavior. API sidecar
+substitution additionally removes the obsolete blanket-authority memory
+wrapper at replay, creating one intentional cache boundary after upgrade.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, normalize_legacy_api_content
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -142,9 +143,9 @@ def compose_user_api_content(
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
     clean content) and the ``api_messages`` build in ``conversation_loop``
-    sends the same helper's output, so the persisted sidecar can never drift
-    from the bytes on the wire — which is the whole prompt-cache invariant:
-    what turn N sends must be what turn N+1 replays.
+    sends the same helper's output. Newly composed sidecars therefore match
+    the wire exactly. The sole replay exception is the one-time removal of an
+    obsolete blanket-authority memory wrapper from historical sidecars.
 
     Returns ``None`` when nothing is injected (multimodal/non-string content,
     or no ephemeral context), meaning the message is sent as-is.
@@ -169,14 +170,16 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     Used at every API-bound message-build site (the ``api_messages`` build in
     ``conversation_loop``, the max-iterations summary in
     ``chat_completion_helpers``, the chat-completions transport). The sidecar
-    carries the exact bytes previously sent to the API for this message when
-    they differ from the clean stored content; substituting it here keeps the
-    provider prompt-cache prefix byte-stable across turns.
+    normally carries the exact bytes previously sent to the API for this
+    message. Historical sidecars containing the obsolete blanket-authority
+    memory wrapper are normalized once; every other sidecar remains byte-stable.
 
-    Returns the popped sidecar string (for callers that need the value for
-    current-turn composition logic) or ``None`` when absent.
+    Returns the normalized popped sidecar string (for callers that need the
+    value for current-turn composition logic) or ``None`` when absent.
     """
     sidecar = api_msg.pop("api_content", None)
+    if isinstance(sidecar, str):
+        sidecar = normalize_legacy_api_content(sidecar)
     if (
         isinstance(sidecar, str)
         and sidecar
