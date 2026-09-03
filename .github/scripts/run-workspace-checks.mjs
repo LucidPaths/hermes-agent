@@ -45,6 +45,33 @@ function discoverUnits() {
   return units
 }
 
+/** @param {string[]} argv @returns {number|undefined} */
+function parseConcurrencyArgument(argv) {
+  const occurrences = argv.reduce(
+    (count, arg) => count + (arg === '--concurrency' ? 1 : 0),
+    0,
+  )
+  if (occurrences === 0) return undefined
+  if (occurrences > 1) {
+    throw new Error('--concurrency must be specified at most once')
+  }
+
+  const flagIdx = argv.indexOf('--concurrency')
+  const value = argv[flagIdx + 1]
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error('--concurrency requires one finite positive integer value')
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`--concurrency must be a finite positive integer, got ${JSON.stringify(value)}`)
+  }
+
+  const concurrency = Number(value)
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+    throw new Error(`--concurrency must be a finite positive integer, got ${JSON.stringify(value)}`)
+  }
+  return concurrency
+}
+
 /** @param {{pkg: string, script: string}} unit */
 function runUnit(unit) {
   return new Promise((resolve) => {
@@ -76,6 +103,14 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
+  let requestedConcurrency
+  try {
+    requestedConcurrency = parseConcurrencyArgument(argv)
+  } catch (err) {
+    console.error(`::error::${err.message}`)
+    process.exit(2)
+  }
+
   const units = discoverUnits()
 
   if (units.length === 0) {
@@ -90,11 +125,7 @@ async function main() {
     return
   }
 
-  const flagIdx = argv.indexOf('--concurrency')
-  const concurrency = Math.max(
-    1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
-  )
+  const concurrency = requestedConcurrency ?? Math.min(units.length, availableParallelism())
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)

@@ -9,7 +9,7 @@ you are about to push:
     python3 scripts/audit_pr_attribution.py --fix      # create mapping files
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - scans ``git log $(git merge-base origin/<base-ref> HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -26,12 +26,18 @@ Logic (kept in sync with contributor-check.yml):
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class BaseRefError(RuntimeError):
+    """Raised when no trustworthy base branch can be determined."""
+
 
 SKIP_SUBSTRINGS = (
     "teknium",
@@ -55,9 +61,50 @@ def run(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
-    log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
+def _default_base_ref() -> str:
+    """Resolve a base branch for local/non-PR invocations."""
+    configured = os.environ.get("GITHUB_BASE_REF", "").strip()
+    if configured:
+        return configured
+    try:
+        remote_head = run(
+            "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+        )
+    except RuntimeError as exc:
+        raise BaseRefError(
+            "Cannot determine the repository default branch: git could not read "
+            "refs/remotes/origin/HEAD. Re-run with --base-ref BRANCH or set "
+            "GITHUB_BASE_REF."
+        ) from exc
+    if not remote_head.startswith("origin/") or not remote_head.removeprefix("origin/"):
+        raise BaseRefError(
+            "Cannot determine the repository default branch: "
+            "refs/remotes/origin/HEAD is missing or invalid. Re-run with "
+            "--base-ref BRANCH or set GITHUB_BASE_REF."
+        )
+    remote_ref = remote_head.removeprefix("origin/")
+    try:
+        run("git", "rev-parse", "--verify", f"refs/remotes/origin/{remote_ref}^{{commit}}")
+    except RuntimeError as exc:
+        raise BaseRefError(
+            "Cannot determine the repository default branch: "
+            f"origin/{remote_ref} does not resolve to a commit. Re-run with "
+            "--base-ref BRANCH or set GITHUB_BASE_REF."
+        ) from exc
+    return remote_ref
+
+
+def new_emails(base_ref: str | None = None) -> list[str]:
+    base_ref = _default_base_ref() if base_ref is None else base_ref
+    try:
+        base = run("git", "merge-base", f"origin/{base_ref}", "HEAD")
+    except RuntimeError as exc:
+        raise BaseRefError(
+            "Cannot determine a merge base for "
+            f"origin/{base_ref} and HEAD. Re-run with --base-ref BRANCH or set "
+            "GITHUB_BASE_REF."
+        ) from exc
+    log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges")
     return sorted({e for e in log.splitlines() if e.strip()})
 
 
@@ -101,11 +148,15 @@ def resolve_login(email: str) -> tuple[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-ref", help="reviewed base branch (defaults to PR context or origin HEAD)")
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
     args = parser.parse_args()
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    try:
+        unmapped = [e for e in new_emails(args.base_ref) if not is_mapped(e)]
+    except BaseRefError as exc:
+        parser.error(str(exc))
     if not unmapped:
         print("✅ All contributor emails on this branch are mapped.")
         return 0
