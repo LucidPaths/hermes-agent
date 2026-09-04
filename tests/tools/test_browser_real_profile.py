@@ -964,6 +964,13 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+        chrome_proc = Mock()
+        chrome_proc.poll.return_value = None
+
+        def launch_chrome(*_args, **_kwargs):
+            (tmp_path / "DevToolsActivePort").write_text("9251\n", encoding="utf-8")
+            return chrome_proc
+
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
@@ -973,6 +980,9 @@ class TestReviewRound3:
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch("hermes_cli.browser_connect.chromium_executable",
+                   return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=launch_chrome), \
              patch.object(bt.subprocess, "run", return_value=proc), \
              patch.object(bt, "_is_headed_mode", return_value=False):
             cdp, err = bt._real_profile_cdp()
