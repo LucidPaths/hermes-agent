@@ -472,6 +472,9 @@ class TestSalvageFollowups:
 
         runner._release_evicted_agent_soft(agent)
 
+        agent.release_memory_provider_binding.assert_called_once_with()
+        agent.shutdown_memory_provider.assert_not_called()
+        agent.release_clients.assert_called_once_with()
         assert agent._session_messages == []
         assert agent._db_flush_scan_prefix is None
 

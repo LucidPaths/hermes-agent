@@ -464,6 +464,22 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _initialize_agent_with_rollback(agent, initializer, **kwargs) -> None:
+    """Run constructor initialization and release any partially attached provider."""
+    try:
+        initializer(agent, **kwargs)
+    except BaseException:
+        manager = getattr(agent, "_memory_manager", None)
+        if manager is not None:
+            try:
+                manager.shutdown_all()
+            except Exception:
+                logger.exception(
+                    "Memory provider rollback failed during agent construction"
+                )
+        raise
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -569,6 +585,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        memory_provider_factory: Optional[Callable[[str], Any]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -579,8 +596,9 @@ class AIAgent:
                 stacklevel=2,
             )
         from agent.agent_init import init_agent
-        init_agent(
+        _initialize_agent_with_rollback(
             self,
+            init_agent,
             base_url=base_url,
             api_key=api_key,
             provider=provider,
@@ -660,6 +678,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            memory_provider_factory=memory_provider_factory,
         )
 
     def _get_session_db_for_recall(self):
@@ -4867,7 +4886,19 @@ class AIAgent:
             },
         )
 
-    def shutdown_memory_provider(self, messages: list = None) -> None:
+    def release_memory_provider_binding(self) -> None:
+        """Release providers without ending the logical session."""
+        if getattr(self, "_memory_provider_binding_released", False):
+            return
+        self._memory_provider_binding_released = True
+        manager = getattr(self, "_memory_manager", None)
+        if manager:
+            try:
+                manager.shutdown_all()
+            except Exception:
+                logger.debug("Memory provider binding release failed", exc_info=True)
+
+    def shutdown_memory_provider(self, messages: Optional[list] = None) -> None:
         """Shut down the memory provider and context engine at session end.
 
         Idempotent: gateway cleanup and AIAgent.close() may share this
@@ -4876,15 +4907,18 @@ class AIAgent:
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        manager = getattr(self, "_memory_manager", None)
+        if manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
-            except Exception:
-                pass
+            if not getattr(self, "_memory_provider_binding_released", False):
+                try:
+                    manager.shutdown_all()
+                except Exception:
+                    pass
+                self._memory_provider_binding_released = True
         # Notify context engine of session end (flush DAG, close DBs, etc.)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -5069,9 +5103,12 @@ class AIAgent:
         # duplicate extraction while direct callers cannot skip provider close.
         try:
             session_messages = getattr(self, "_session_messages", None)
-            self.shutdown_memory_provider(
-                session_messages if isinstance(session_messages, list) else None
-            )
+            if getattr(self, "_end_session_on_close", True) is False:
+                self.release_memory_provider_binding()
+            else:
+                self.shutdown_memory_provider(
+                    session_messages if isinstance(session_messages, list) else None
+                )
         except Exception:
             pass
 

@@ -202,6 +202,12 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+                for _ in range(100):
+                    if data["run_id"] not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.01)
+                assert data["run_id"] not in adapter._active_run_tasks
+                mock_agent.release_memory_provider_binding.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):

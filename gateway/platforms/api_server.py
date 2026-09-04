@@ -3231,6 +3231,17 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        memory_provider_factory = None
+        memory_config = user_config.get("memory")
+        if isinstance(memory_config, dict) and memory_config.get("provider") == "hermes_cortex":
+            runner = self.gateway_runner
+            factory_for = getattr(runner, "_memory_provider_factory_for", None)
+            if not callable(factory_for):
+                raise RuntimeError("cortex-gateway-runtime-registry-unavailable")
+            memory_provider_factory = factory_for(user_config)
+            if memory_provider_factory is None:
+                raise RuntimeError("cortex-gateway-runtime-registry-unavailable")
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
@@ -3250,6 +3261,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "memory_provider_factory": memory_provider_factory,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -7643,6 +7655,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id,
                                 gateway_session_key,
                             )
+                        release_binding = getattr(
+                            agent, "release_memory_provider_binding", None
+                        )
+                        if callable(release_binding):
+                            release_binding()
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()

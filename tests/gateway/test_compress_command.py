@@ -166,7 +166,8 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     assert "auxiliary.compression.model" in result
     # The user's context is explicitly called out as intact
     assert "intact" in result
-    agent_instance.shutdown_memory_provider.assert_called_once()
+    agent_instance.release_memory_provider_binding.assert_called_once()
+    agent_instance.shutdown_memory_provider.assert_not_called()
     agent_instance.close.assert_called_once()
 
 
@@ -222,7 +223,8 @@ async def test_compress_command_in_place_skips_destructive_rewrite():
     # persisted, and rewrite_transcript would wipe the archived rows.
     runner.session_store.rewrite_transcript.assert_not_called()
     assert session_entry.session_id == "sess-1"
-    agent_instance.shutdown_memory_provider.assert_called_once()
+    agent_instance.release_memory_provider_binding.assert_called_once()
+    agent_instance.shutdown_memory_provider.assert_not_called()
     agent_instance.close.assert_called_once()
 
 
@@ -261,6 +263,41 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     # Stable gateway session key preserved, identical to a normal gateway turn.
     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
     assert kwargs["gateway_session_key"]
+
+
+@pytest.mark.asyncio
+async def test_compress_checkpoint_uses_runner_owned_cortex_factory():
+    history = _make_history()
+    runner = _make_runner(history)
+    runner._cortex_runtime_registry = MagicMock()
+    from gateway.run import _gateway_config_home
+
+    runner._cortex_runtime_registry.key.hermes_home = _gateway_config_home().resolve()
+    runner._cortex_runtime_registry.key.profile_identity = runner._active_profile_name()
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+    user_config = {
+        "memory": {"provider": "hermes_cortex"},
+        "compression": {"checkpoint_required": True},
+    }
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("hermes_cli.config.load_config", return_value=user_config),
+        patch("run_agent.AIAgent", return_value=agent_instance) as mock_agent,
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs["skip_memory"] is False
+    assert kwargs["memory_provider_factory"] == runner._cortex_runtime_registry.borrow
 
 
 @pytest.mark.asyncio
