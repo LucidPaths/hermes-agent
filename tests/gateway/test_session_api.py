@@ -168,6 +168,33 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_api_agent_releases_cortex_binding_when_turn_raises(
+    adapter, monkeypatch
+):
+    released: list[bool] = []
+
+    class FakeAgent:
+        session_id = "request-session"
+
+        def run_conversation(self, **_kwargs):
+            raise RuntimeError("boom")
+
+        def release_memory_provider_binding(self) -> None:
+            released.append(True)
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="request-session",
+        )
+
+    assert released == [True]
+
+
+@pytest.mark.asyncio
 async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypatch):
     observed = {}
 

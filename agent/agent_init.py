@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    memory_provider_factory: Optional[Callable[[str], Any]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -1944,6 +1945,8 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
+    agent._memory_provider_factory = memory_provider_factory
+    agent._memory_provider_binding_released = False
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
@@ -1952,7 +1955,11 @@ def init_agent(
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
+                _mp = (
+                    memory_provider_factory(_mem_provider_name)
+                    if memory_provider_factory is not None
+                    else _load_mem(_mem_provider_name)
+                )
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
@@ -2022,6 +2029,8 @@ def init_agent(
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
         except Exception as _mpe:
+            if memory_provider_factory is not None:
+                raise
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 

@@ -843,6 +843,11 @@ async def _handle_runs(
                         # run deliberately left running (same race-window
                         # guard as gateway/run.py and _run_agent above).
                         _clear_turn_process_ownership(agent)
+                        release_binding = getattr(
+                            agent, "release_memory_provider_binding", None
+                        )
+                        if callable(release_binding):
+                            release_binding()
                         # /v1/runs owns its agent lifecycle, so it records
                         # the declared conversation itself rather than
                         # through _run_agent's bind_declared_conversation

@@ -6369,6 +6369,9 @@ class TurnRunner:
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
+                memory_provider_factory=self._runner._memory_provider_factory_for(
+                    ctx.user_config
+                ),
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -7788,6 +7791,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        from gateway.cortex_runtime_registry import GatewayCortexRuntimeRegistry
+
+        self._cortex_runtime_registry = GatewayCortexRuntimeRegistry(
+            hermes_home=_gateway_config_home().resolve(),
+            profile_identity=self._active_profile_name(),
+        )
 
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
@@ -12403,7 +12412,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # call signature-compatible with the pre-fix behaviour
                 # (``shutdown_memory_provider(messages=None)``).
                 session_messages = getattr(agent, "_session_messages", None)
-                if isinstance(session_messages, list):
+                if getattr(agent, "_end_session_on_close", True) is False:
+                    agent.release_memory_provider_binding()
+                elif isinstance(session_messages, list):
                     agent.shutdown_memory_provider(session_messages)
                 else:
                     agent.shutdown_memory_provider()
@@ -14249,6 +14260,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # with a skeleton system prompt.  Start warming NOW so the work
         # overlaps the network-bound platform connects below;
         # _finish_startup_restore awaits it (bounded) before opening the gate.
+        if not self._ensure_cortex_runtime_for_config(_load_gateway_config()):
+            return False
         self._start_startup_warmup()
 
         connected_count = 0
@@ -16584,6 +16597,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             timeout = self._restart_drain_timeout
+            _shutdown_deadline = _stop_started_at + timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
             # If the process is killed by the service manager during the
@@ -16818,6 +16832,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # is why SIGTERM failed to kill the process (#53175).
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
+                    )
+
+            # Every accepted turn/API/background borrower has now drained or
+            # been boundedly interrupted, and cached borrowers are detached.
+            # Spend only the remainder of the existing gateway drain deadline
+            # closing the one runner-owned Cortex authority.
+            _cortex_registry = getattr(self, "_cortex_runtime_registry", None)
+            if _cortex_registry is not None:
+                _cortex_budget = max(0.0, _shutdown_deadline - time.monotonic())
+                try:
+                    _cortex_closed = await asyncio.to_thread(
+                        _cortex_registry.shutdown, _cortex_budget
+                    )
+                except Exception:
+                    _cortex_closed = False
+                    logger.exception("Cortex runtime owner shutdown failed")
+                if not _cortex_closed:
+                    logger.error(
+                        "Cortex runtime owner did not close within the gateway "
+                        "drain deadline"
                     )
 
             # Completion flush tasks can be sleeping in their fan-in window or
@@ -22002,8 +22036,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 from hermes_cli.config import load_config as _load_cfg
                                 from utils import is_truthy_value as _is_truthy
 
+                                _hyg_user_config = _load_cfg() or {}
                                 _hyg_checkpoint_required = _is_truthy(
-                                    ((_load_cfg() or {}).get("compression") or {}).get(
+                                    (_hyg_user_config.get("compression") or {}).get(
                                         "checkpoint_required"
                                     ),
                                     default=False,
@@ -22017,6 +22052,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    memory_provider_factory=(
+                                        self._memory_provider_factory_for(_hyg_user_config)
+                                        if _hyg_checkpoint_required
+                                        else None
+                                    ),
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -25561,6 +25601,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
+                    memory_provider_factory=self._memory_provider_factory_for(
+                        user_config
+                    ),
                 )
                 try:
                     return agent.run_conversation(
@@ -30153,6 +30196,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
+    def _memory_provider_factory_for(self, user_config: dict) -> Any:
+        """Expose the runner-owned Cortex borrower only for explicit Cortex config."""
+        memory = user_config.get("memory")
+        if not isinstance(memory, dict) or memory.get("provider") != "hermes_cortex":
+            return None
+        key = self._cortex_runtime_registry.key
+        if (
+            key.hermes_home != _gateway_config_home().resolve()
+            or key.profile_identity != self._active_profile_name()
+        ):
+            raise RuntimeError("cortex-registry-identity-mismatch")
+        return self._cortex_runtime_registry.borrow
+
+    def _ensure_cortex_runtime_for_config(self, user_config: dict) -> bool:
+        """Start configured Cortex authority before any gateway admission."""
+        try:
+            if self._memory_provider_factory_for(user_config) is None:
+                return True
+            self._cortex_runtime_registry.ensure_started()
+        except Exception:
+            reason = "Cortex runtime startup failed"
+            self._exit_with_failure = True
+            self._exit_code = 1
+            self._exit_reason = reason
+            self._update_runtime_status("startup_failed", reason)
+            logger.exception(reason)
+            return False
+        return True
+
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc).
 
@@ -30331,6 +30403,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if agent is None:
             return
         try:
+            if hasattr(agent, "release_memory_provider_binding"):
+                agent.release_memory_provider_binding()
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
             else:

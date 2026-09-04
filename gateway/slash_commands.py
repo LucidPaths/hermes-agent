@@ -4723,8 +4723,9 @@ class GatewaySlashCommandsMixin:
             from hermes_cli.config import load_config as _load_cfg
             from utils import is_truthy_value as _is_truthy
 
+            _compression_user_config = _load_cfg() or {}
             _checkpoint_required = _is_truthy(
-                ((_load_cfg() or {}).get("compression") or {}).get(
+                (_compression_user_config.get("compression") or {}).get(
                     "checkpoint_required"
                 ),
                 default=False,
@@ -4738,6 +4739,13 @@ class GatewaySlashCommandsMixin:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
+                memory_provider_factory=(
+                    getattr(self, "_memory_provider_factory_for")(
+                        _compression_user_config
+                    )
+                    if _checkpoint_required
+                    else None
+                ),
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
             # Keep the real source platform during construction so external

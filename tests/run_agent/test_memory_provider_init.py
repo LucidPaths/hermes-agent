@@ -1,7 +1,9 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 class RecordingMemoryProvider:
@@ -10,6 +12,8 @@ class RecordingMemoryProvider:
     def __init__(self):
         self.init_kwargs = None
         self.init_session_id = None
+        self.shutdown_calls = 0
+        self.session_end_calls = 0
 
     def is_available(self):
         return True
@@ -22,7 +26,10 @@ class RecordingMemoryProvider:
         return []
 
     def shutdown(self):
-        pass
+        self.shutdown_calls += 1
+
+    def on_session_end(self, _messages):
+        self.session_end_calls += 1
 
 
 def test_shutdown_memory_provider_is_idempotent():
@@ -126,6 +133,96 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+def test_aiagent_uses_injected_provider_factory_and_releases_binding_only():
+    provider = RecordingMemoryProvider()
+    provider.name = "hermes_cortex"
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider") as default_loader,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        factory_calls = []
+
+        def provider_factory(name):
+            factory_calls.append(name)
+            return provider
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            session_id="gateway-session",
+            platform="telegram",
+            user_id="user-a",
+            memory_provider_factory=provider_factory,
+        )
+
+    assert factory_calls == ["hermes_cortex"]
+    default_loader.assert_not_called()
+    assert provider.init_session_id == "gateway-session"
+    assert provider.init_kwargs["user_id"] == "user-a"
+    agent.release_memory_provider_binding()
+    agent.release_memory_provider_binding()
+    assert provider.shutdown_calls == 1
+    assert provider.session_end_calls == 0
+
+
+def test_aiagent_constructor_rolls_back_attached_provider_on_late_failure():
+    from run_agent import AIAgent
+
+    manager = MagicMock()
+
+    def fail_after_binding(agent, **_kwargs):
+        agent._memory_manager = manager
+        agent._memory_provider_factory = object()
+        agent._memory_provider_binding_released = False
+        raise RuntimeError("late-constructor-failure")
+
+    with patch("agent.agent_init.init_agent", side_effect=fail_after_binding):
+        with pytest.raises(RuntimeError, match="late-constructor-failure"):
+            AIAgent(model="test-model", api_key="test-key")
+
+    manager.shutdown_all.assert_called_once_with()
+
+
+def test_injected_provider_factory_failure_is_not_silently_disabled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    def refuse(_name):
+        raise RuntimeError("cortex-registry-draining")
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError, match="cortex-registry-draining"):
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                memory_provider_factory=refuse,
+            )
 
 
 class CoreShadowProvider:
