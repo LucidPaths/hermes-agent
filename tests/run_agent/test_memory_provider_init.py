@@ -15,7 +15,7 @@ class RecordingMemoryProvider:
         self.shutdown_calls = 0
         self.session_end_calls = 0
 
-    def is_available(self):
+    def is_available(self) -> bool:
         return True
 
     def initialize(self, session_id, **kwargs):
@@ -30,6 +30,44 @@ class RecordingMemoryProvider:
 
     def on_session_end(self, _messages):
         self.session_end_calls += 1
+
+
+class CortexReadinessProvider(RecordingMemoryProvider):
+    name = "hermes_cortex"
+
+    def __init__(self, state, reason=""):
+        super().__init__()
+        self.runtime_readiness = SimpleNamespace(state=state, reason=reason)
+
+
+class UnavailableCortexProvider(CortexReadinessProvider):
+    def is_available(self) -> bool:
+        return False
+
+
+class RaisingInitializeCortexProvider(CortexReadinessProvider):
+    def initialize(self, session_id, **kwargs):
+        del session_id, kwargs
+        raise ValueError("secret initialize failure")
+
+
+class RaisingSchemasCortexProvider(CortexReadinessProvider):
+    def get_tool_schemas(self):
+        raise ValueError("secret schema failure")
+
+
+class RaisingStateValue:
+    @property
+    def value(self):
+        raise ValueError("property boom")
+
+
+class HostileString(str):
+    def __hash__(self):
+        raise ValueError("hash boom")
+
+    def __eq__(self, _other):
+        raise ValueError("equality boom")
 
 
 def test_shutdown_memory_provider_is_idempotent():
@@ -136,8 +174,7 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
 
 
 def test_aiagent_uses_injected_provider_factory_and_releases_binding_only():
-    provider = RecordingMemoryProvider()
-    provider.name = "hermes_cortex"
+    provider = CortexReadinessProvider("ready")
     cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
 
     with (
@@ -215,7 +252,7 @@ def test_injected_provider_factory_failure_is_not_silently_disabled(
     ):
         from run_agent import AIAgent
 
-        with pytest.raises(RuntimeError, match="cortex-registry-draining"):
+        with pytest.raises(RuntimeError) as exc_info:
             AIAgent(
                 api_key="test-key-1234567890",
                 base_url="https://openrouter.ai/api/v1",
@@ -223,6 +260,269 @@ def test_injected_provider_factory_failure_is_not_silently_disabled(
                 skip_context_files=True,
                 memory_provider_factory=refuse,
             )
+
+    assert str(exc_info.value) == (
+        "cortex-runtime-unavailable:cortex-registry-draining"
+    )
+
+
+def test_configured_cortex_loader_failure_is_stable_and_bounded():
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch(
+            "plugins.memory.load_memory_provider",
+            side_effect=ValueError("secret loader failure\nnext"),
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform="cli",
+            )
+
+    assert str(exc_info.value) == (
+        "cortex-runtime-unavailable:cortex-runtime-not-started"
+    )
+
+
+@pytest.mark.parametrize("platform", ["cli", "cron"])
+def test_configured_cortex_unavailable_fails_closed_before_agent_admission(platform):
+    provider = UnavailableCortexProvider("not-started")
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform=platform,
+            )
+
+    assert str(exc_info.value) == (
+        "cortex-runtime-unavailable:cortex-runtime-not-started"
+    )
+    assert provider.shutdown_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("configured_name", "provider", "expected"),
+    [
+        (
+            HostileString("hermes_cortex"),
+            CortexReadinessProvider("ready"),
+            "cortex-runtime-readiness-invalid",
+        ),
+        (
+            "hermes_cortex",
+            RaisingInitializeCortexProvider("ready"),
+            "cortex-runtime-readiness-invalid",
+        ),
+    ],
+)
+def test_configured_cortex_detection_and_initialize_failures_are_stable(
+    configured_name, provider, expected
+):
+    cfg = {"memory": {"provider": configured_name}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform="cli",
+            )
+
+    assert str(exc_info.value) == f"cortex-runtime-unavailable:{expected}"
+    if type(configured_name) is str and configured_name == "hermes_cortex":
+        assert provider.shutdown_calls == 1
+
+
+def test_configured_cortex_registration_failure_is_stable_and_closes_once():
+    provider = RaisingSchemasCortexProvider("ready")
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform="cli",
+            )
+
+    assert str(exc_info.value) == (
+        "cortex-runtime-unavailable:cortex-runtime-readiness-invalid"
+    )
+    assert provider.shutdown_calls == 1
+
+
+@pytest.mark.parametrize("platform", ["cli", "cron"])
+@pytest.mark.parametrize(
+    ("state", "reason", "expected"),
+    [
+        ("failed", "writer-lease-unavailable", "writer-lease-unavailable"),
+        (
+            "failed",
+            "secret=abc\n\nnext",
+            "cortex-runtime-readiness-invalid",
+        ),
+        ("pending", "", "cortex-runtime-pending"),
+        ("not-started", "", "cortex-runtime-not-started"),
+        ("closed", "", "cortex-runtime-closed"),
+        (object(), "", "cortex-runtime-readiness-invalid"),
+        (RaisingStateValue(), "", "cortex-runtime-readiness-invalid"),
+        (HostileString("failed"), "", "cortex-runtime-readiness-invalid"),
+        (
+            "failed",
+            HostileString("writer-lease-unavailable"),
+            "cortex-runtime-readiness-invalid",
+        ),
+    ],
+)
+def test_standalone_cortex_requires_terminal_ready_before_agent_admission(
+    platform, state, reason, expected
+):
+    provider = CortexReadinessProvider(state, reason)
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError) as exc_info:
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform=platform,
+            )
+
+    assert str(exc_info.value) == f"cortex-runtime-unavailable:{expected}"
+
+    assert provider.shutdown_calls == 1
+
+
+@pytest.mark.parametrize("platform", ["cli", "cron"])
+def test_standalone_cortex_ready_state_admits_agent(platform):
+    provider = CortexReadinessProvider("ready")
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            platform=platform,
+        )
+
+    assert getattr(agent, "_memory_manager", None) is not None
+    assert provider.shutdown_calls == 0
+    agent.close()
+    assert provider.shutdown_calls == 1
+
+
+@pytest.mark.parametrize("readiness", [None, SimpleNamespace(state="ready")])
+def test_standalone_cortex_rejects_absent_or_malformed_readiness(readiness):
+    provider = RecordingMemoryProvider()
+    provider.name = "hermes_cortex"
+    if readiness is not None:
+        setattr(provider, "runtime_readiness", readiness)
+    cfg = {"memory": {"provider": "hermes_cortex"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        with pytest.raises(RuntimeError, match="cortex-runtime-readiness-invalid"):
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                platform="cli",
+            )
+
+    assert provider.shutdown_calls == 1
 
 
 class CoreShadowProvider:

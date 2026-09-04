@@ -670,6 +670,50 @@ class TestRunJobSessionPersistence:
         assert "file" in (kwargs["enabled_toolsets"] or [])
         assert "memory" not in kwargs["disabled_toolsets"]
 
+    def test_run_job_surfaces_typed_cortex_unavailability_before_conversation(
+        self, tmp_path
+    ):
+        job = {
+            "id": "cortex-contender-job",
+            "name": "cortex contender",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.get_shared_session_db", return_value=fake_db),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch(
+                "run_agent.AIAgent",
+                side_effect=RuntimeError(
+                    "cortex-runtime-unavailable:writer-lease-unavailable"
+                ),
+            ) as agent_cls,
+        ):
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == (
+            "RuntimeError: "
+            "cortex-runtime-unavailable:writer-lease-unavailable"
+        )
+        assert "cortex-runtime-unavailable:writer-lease-unavailable" in output
+        agent_cls.assert_called_once()
+        fake_db.close.assert_called_once()
+
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
         from cron.scheduler import tick

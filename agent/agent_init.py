@@ -66,6 +66,81 @@ logger = logging.getLogger("run_agent")
 # fire on every turn.
 _warned_unavailable_providers: set[str] = set()
 
+_CORTEX_STARTUP_REASON_CODES = frozenset(
+    {
+        "edge-construction-failed",
+        "kernel-open-failed",
+        "owner-thread-start-failed",
+        "startup-closed",
+        "startup-not-started",
+        "startup-pending",
+        "unclean-shutdown",
+        "unreadable-state",
+        "writer-lease-unavailable",
+    }
+)
+_CORTEX_FACTORY_FAILURE_CODES = frozenset(
+    {
+        "cortex-provider-mismatch",
+        "cortex-provider-unavailable",
+        "cortex-registry-draining",
+        "cortex-runtime-factory-unavailable",
+        "cortex-runtime-startup-failed",
+    }
+)
+
+
+def _require_cortex_runtime_ready(provider: Any) -> None:
+    """Refuse a configured Cortex provider unless startup is terminal-ready."""
+    try:
+        readiness = provider.runtime_readiness
+        raw_state = readiness.state
+        reason = readiness.reason
+        state = getattr(raw_state, "value", raw_state)
+    except Exception as exc:
+        raise RuntimeError(
+            "cortex-runtime-unavailable:cortex-runtime-readiness-invalid"
+        ) from exc
+
+    if type(state) is not str or state not in {
+        "not-started",
+        "pending",
+        "ready",
+        "failed",
+        "closed",
+    }:
+        raise RuntimeError(
+            "cortex-runtime-unavailable:cortex-runtime-readiness-invalid"
+        )
+    if state == "ready":
+        return
+    if reason is None or (type(reason) is str and reason == ""):
+        detail = f"cortex-runtime-{state}"
+    elif type(reason) is str and reason in _CORTEX_STARTUP_REASON_CODES:
+        detail = reason
+    else:
+        detail = "cortex-runtime-readiness-invalid"
+    raise RuntimeError(f"cortex-runtime-unavailable:{detail}")
+
+
+def _shutdown_unregistered_cortex(provider: Any) -> None:
+    """Release a loaded Cortex provider not yet owned by MemoryManager."""
+    if provider is None:
+        return
+    try:
+        provider.shutdown()
+    except Exception:
+        pass
+
+
+def _cortex_load_failure_detail(exc: Exception, *, injected: bool) -> str:
+    """Normalize loader/factory failures without rendering arbitrary text."""
+    if injected and type(exc) is RuntimeError and len(exc.args) == 1:
+        reason = exc.args[0]
+        if type(reason) is str and reason in _CORTEX_FACTORY_FAILURE_CODES:
+            return reason
+    return "cortex-runtime-not-started"
+
 
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
@@ -1947,20 +2022,68 @@ def init_agent(
     agent._memory_manager = None
     agent._memory_provider_factory = memory_provider_factory
     agent._memory_provider_binding_released = False
+    _mem_provider_name = ""
+    _cortex_configured = False
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _cortex_configured = (
+                isinstance(_mem_provider_name, str)
+                and str.__eq__(_mem_provider_name, "hermes_cortex") is True
+            )
+            if _cortex_configured and type(_mem_provider_name) is not str:
+                raise RuntimeError(
+                    "cortex-runtime-unavailable:cortex-runtime-readiness-invalid"
+                )
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
-                _mp = (
-                    memory_provider_factory(_mem_provider_name)
-                    if memory_provider_factory is not None
-                    else _load_mem(_mem_provider_name)
-                )
-                if _mp and _mp.is_available():
+                try:
+                    _mp = (
+                        memory_provider_factory(_mem_provider_name)
+                        if memory_provider_factory is not None
+                        else _load_mem(_mem_provider_name)
+                    )
+                except Exception as exc:
+                    if _cortex_configured:
+                        detail = _cortex_load_failure_detail(
+                            exc,
+                            injected=memory_provider_factory is not None,
+                        )
+                        raise RuntimeError(
+                            f"cortex-runtime-unavailable:{detail}"
+                        ) from exc
+                    raise
+                if _cortex_configured:
+                    try:
+                        _cortex_available = (
+                            _mp is not None and _mp.is_available() is True
+                        )
+                    except Exception as exc:
+                        _shutdown_unregistered_cortex(_mp)
+                        raise RuntimeError(
+                            "cortex-runtime-unavailable:cortex-runtime-not-started"
+                        ) from exc
+                    if not _cortex_available:
+                        _shutdown_unregistered_cortex(_mp)
+                        raise RuntimeError(
+                            "cortex-runtime-unavailable:cortex-runtime-not-started"
+                        )
+                    try:
+                        agent._memory_manager.add_provider(_mp)
+                    except Exception as exc:
+                        if not any(
+                            provider is _mp
+                            for provider in agent._memory_manager.providers
+                        ):
+                            _shutdown_unregistered_cortex(_mp)
+                        raise RuntimeError(
+                            "cortex-runtime-unavailable:"
+                            "cortex-runtime-readiness-invalid"
+                        ) from exc
+                elif _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
                     # Skip the (potentially expensive) unavailable_reason() call
@@ -2023,13 +2146,23 @@ def init_agent(
                     # indicator) is wired above, CLI-only — gateway status is
                     # delivered on a different path (see the platform=="cli"
                     # block), and the indicator no-ops when it's absent.
-                    agent._memory_manager.initialize_all(**_init_kwargs)
+                    if _cortex_configured:
+                        try:
+                            _mp.initialize(**_init_kwargs)
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "cortex-runtime-unavailable:"
+                                "cortex-runtime-readiness-invalid"
+                            ) from exc
+                        _require_cortex_runtime_ready(_mp)
+                    else:
+                        agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
         except Exception as _mpe:
-            if memory_provider_factory is not None:
+            if memory_provider_factory is not None or _cortex_configured:
                 raise
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
